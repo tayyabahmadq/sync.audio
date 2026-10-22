@@ -189,6 +189,37 @@ io.on('connection', (socket: Socket) => {
     ack?.({ c0: data?.c0 ?? 0, s: Date.now() })
   })
 
+  /* -------------------------------------------- lip-sync wizard signalling */
+  // Host flashes the TV overlay and tags each flash with the video playhead;
+  // the relay stamps its own wall-clock so listeners can relate the flash to
+  // their tap without any cross-device clock assumptions.
+  socket.on('sync:wizard', (data: { kind: 'flash'; mediaTsMs?: number; index?: number; total?: number } | { kind: 'request' }) => {
+    const ctx = socketSession.get(socket.id)
+    if (!ctx) return
+    const s = sessions.get(ctx.code)
+    if (!s) return
+    s.lastActiveAt = Date.now()
+    if (ctx.role === 'host' && data?.kind === 'flash') {
+      socket.to(`sess:${ctx.code}`).emit('sync:wizard', {
+        kind: 'flash',
+        mediaTsMs: data.mediaTsMs,
+        index: data.index,
+        total: data.total,
+        relayTs: Date.now(),
+      })
+    }
+    if (ctx.role === 'listener' && data?.kind === 'request') {
+      if (s.hostSocketId) {
+        io.to(s.hostSocketId).emit('sync:wizard', {
+          kind: 'request',
+          relayTs: Date.now(),
+          from: socket.id,
+          name: s.listeners.get(socket.id)?.name || 'Listener',
+        })
+      }
+    }
+  })
+
   /* -------------------------------------------------------- listener stats */
   socket.on('sync:stats', (data: { rtt?: number; bufferMs?: number; drift?: number }) => {
     const ctx = socketSession.get(socket.id)

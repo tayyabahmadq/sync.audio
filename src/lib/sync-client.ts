@@ -65,6 +65,7 @@ export class SyncClient {
 
   onStatus: (s: Partial<ClientStatus>) => void = () => {}
   onAudioFrame: () => void = () => {}
+  onWizardFlash: (f: { mediaTsMs?: number; index?: number; total?: number; relayTs: number }) => void = () => {}
 
   status(): ClientStatus {
     return {
@@ -107,6 +108,9 @@ export class SyncClient {
       })
       socket.on('disconnect', () => this.onStatus({ connected: false, joined: false }))
       socket.on('sync:audio', (buf: ArrayBuffer) => this.handleAudio(buf))
+      socket.on('sync:wizard', (d: { kind: string; mediaTsMs?: number; index?: number; total?: number; relayTs?: number }) => {
+        if (d?.kind === 'flash') this.onWizardFlash({ mediaTsMs: d.mediaTsMs, index: d.index, total: d.total, relayTs: d.relayTs || Date.now() })
+      })
       socket.on('sync:state', (d: { state: 'idle' | 'playing' | 'paused' }) => {
         this.hostState = d.state
         this.onStatus({ hostState: d.state })
@@ -219,6 +223,13 @@ export class SyncClient {
     this.audioStarted = true
     this.audioStartedAt = Date.now()
 
+    // restore a previously calibrated lip-sync nudge for this session
+    const saved = SyncClient.readSavedOffset(this.sessionCode)
+    if (saved) {
+      this.nudgeOffsetMs(saved)
+      this.onStatus({})
+    }
+
     // Device output-latency compensation: Chrome exposes baseLatency (audio
     // HAL) and outputLatency (playout pipeline, includes some Bluetooth delay).
     // Skipping that much audio right after prefill removes it from the
@@ -258,7 +269,7 @@ export class SyncClient {
 
   /** Primary path — AudioWorklet jitter buffer (audio thread, glitch-free). */
   private async startWorkletPath(ctx: AudioContext): Promise<boolean> {
-    await ctx.audioWorklet.addModule('/worklets/player-worklet.js')
+    await ctx.audioWorklet.addModule('/worklets/player-worklet.js?v=3')
     const node = new AudioWorkletNode(ctx, 'sync-player', {
       numberOfInputs: 0,
       numberOfOutputs: 1,
@@ -273,6 +284,10 @@ export class SyncClient {
         if (d.starving) this.lastStarveAt = Date.now()
         if (typeof d.targetMs === 'number') this.currentTargetMs = d.targetMs
         this.onStatus({ bufferMs: d.fillMs, starving: !!d.starving, streaming: !d.starving, targetMs: Math.round(this.currentTargetMs) })
+      } else if (d?.type === 'playout' && this.probeWaiters.has(d.requestId)) {
+        const resolve = this.probeWaiters.get(d.requestId)!
+        this.probeWaiters.delete(d.requestId)
+        resolve({ mediaTsMs: d.mediaTsMs ?? null, fillMs: d.fillMs ?? 0 })
       }
     }
     const gain = ctx.createGain()
@@ -420,7 +435,7 @@ export class SyncClient {
       this.streamSampleRate = frame.sampleRate
     }
     if (this.node) {
-      this.node.port.postMessage({ type: 'chunk', samples: frame.samples }, [frame.samples.buffer])
+      this.node.port.postMessage({ type: 'chunk', samples: frame.samples, mediaTs: frame.mediaTsMs }, [frame.samples.buffer])
     } else if (this.fallbackPush) {
       this.fallbackPush(frame.samples)
     }
@@ -441,11 +456,50 @@ export class SyncClient {
 
   /** Instant lip-sync nudge. Positive = audio later; negative = audio earlier. */
   nudgeOffsetMs(deltaMs: number) {
-    const d = Math.max(-500, Math.min(500, Math.round(deltaMs)))
+    const d = Math.max(-600, Math.min(600, Math.round(deltaMs)))
     if (!d) return
     this.appliedOffsetMs += d
     this.node?.port.postMessage({ type: 'nudge', deltaMs: d })
     this.fallbackNudge?.(d)
+  }
+
+  /** Media-timeline position (ms) of the audio currently reaching the ear. */
+  probePlayout(): Promise<{ mediaTsMs: number | null; fillMs: number } | null> {
+    if (!this.node) return Promise.resolve(null)
+    const requestId = ++this.probeSeq
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        this.probeWaiters.delete(requestId)
+        resolve(null)
+      }, 400)
+      this.probeWaiters.set(requestId, (r) => {
+        clearTimeout(timer)
+        resolve(r)
+      })
+      this.node!.port.postMessage({ type: 'probe', requestId })
+    })
+  }
+  private probeSeq = 0
+  private probeWaiters = new Map<number, (r: { mediaTsMs: number | null; fillMs: number }) => void>()
+
+  /** Ask the host to run the flash sequence (listener-initiated calibration). */
+  requestWizardCalibration() {
+    this.socket?.emit('sync:wizard', { kind: 'request' })
+  }
+
+  static offsetKey(session: string) {
+    return `sync.offset.${session.toUpperCase()}`
+  }
+
+  static readSavedOffset(session: string): number {
+    try {
+      const v = Number(localStorage.getItem(SyncClient.offsetKey(session)))
+      return Number.isFinite(v) ? Math.max(-600, Math.min(600, v)) : 0
+    } catch { return 0 }
+  }
+
+  static saveOffset(session: string, offsetMs: number) {
+    try { localStorage.setItem(SyncClient.offsetKey(session), String(Math.round(offsetMs))) } catch { /* */ }
   }
 
   private startTimers() {

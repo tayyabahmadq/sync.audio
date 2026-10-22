@@ -32,6 +32,16 @@ export default function Listener({ sessionParam }: { sessionParam: string }) {
   const analyserRef = useRef<AnalyserNode | null>(null)
   const lastFrameRef = useRef(0)
 
+  /* ------------------------------------------------- lip-sync wizard */
+  const [wizard, setWizard] = useState<'idle' | 'tapping' | 'done'>('idle')
+  const [wizardTaps, setWizardTaps] = useState(0)
+  const [wizardMsg, setWizardMsg] = useState('')
+  const [wizardResult, setWizardResult] = useState<number | null>(null)
+  const [flashPulse, setFlashPulse] = useState(false)
+  const flashLogRef = useRef<{ localMs: number; mediaTsMs: number }[]>([])
+  const errsRef = useRef<number[]>([])
+  const hostAskTimerRef = useRef<number | null>(null)
+
   /* --------------------------------------------------------- connect */
   const boot = useCallback((code: string, listenerName: string) => {
     const c = new SyncClient()
@@ -41,6 +51,15 @@ export default function Listener({ sessionParam }: { sessionParam: string }) {
     c.onJoinError = (msg) => setError(msg)
     c.onStatus = (partial) => setStatus((prev) => ({ ...prev, ...partial }))
     c.onAudioFrame = () => { lastFrameRef.current = Date.now() }
+    // TV flash during lip-sync calibration: remember when it happened (mapped
+    // to our own clock via the NTP offset) and which video moment it showed
+    c.onWizardFlash = (f) => {
+      const clockOff = c.status().offsetMs ?? 0
+      flashLogRef.current.push({ localMs: f.relayTs - clockOff, mediaTsMs: f.mediaTsMs ?? -1 })
+      if (flashLogRef.current.length > 6) flashLogRef.current.shift()
+      setFlashPulse(true)
+      setTimeout(() => setFlashPulse(false), 240)
+    }
     c.connect(code, listenerName)
     setStage('ready')
   }, [])
@@ -66,10 +85,69 @@ export default function Listener({ sessionParam }: { sessionParam: string }) {
     if (ok) {
       analyserRef.current = c.analyser
       c.setVolume(volume)
+      setOffset(c.appliedOffsetMs) // reflect any restored calibration
       setStage('live')
     } else {
       setError('Could not start audio engine on this device.')
     }
+  }
+
+  /* ---------------------------------------------- wizard actions */
+  const startWizard = () => {
+    const c = clientRef.current
+    if (!c) return
+    errsRef.current = []
+    flashLogRef.current = []
+    setWizardTaps(0)
+    setWizardResult(null)
+    setWizardMsg('')
+    setWizard('tapping')
+    c.requestWizardCalibration()
+    if (hostAskTimerRef.current) clearTimeout(hostAskTimerRef.current)
+    hostAskTimerRef.current = window.setTimeout(() => {
+      if (flashLogRef.current.length === 0) {
+        setWizardMsg('No flash from the TV — ask the host to press play, then retry.')
+      }
+    }, 5000)
+  }
+
+  const finishWizard = () => {
+    const c = clientRef.current
+    const errs = errsRef.current
+    if (!c || errs.length === 0) return
+    const sorted = [...errs].sort((a, b) => a - b)
+    const med = Math.max(-600, Math.min(600, Math.round(sorted[Math.floor(sorted.length / 2)])))
+    c.nudgeOffsetMs(med)
+    SyncClient.saveOffset(session, c.appliedOffsetMs)
+    setOffset(c.appliedOffsetMs)
+    setWizardResult(med)
+    setWizard('done')
+    setTimeout(() => setWizard('idle'), 2400)
+  }
+
+  const wizardTap = async () => {
+    const c = clientRef.current
+    if (!c) return
+    const probe = await c.probePlayout()
+    if (!probe || probe.mediaTsMs == null) {
+      setWizardMsg('This browser cannot probe playout — use the manual nudges below instead.')
+      return
+    }
+    const f = [...flashLogRef.current].reverse().find((e) => e.mediaTsMs >= 0)
+    if (!f) { setWizardMsg('Wait for the white flash, then tap.'); return }
+    const elapsed = Date.now() - f.localMs
+    if (elapsed < 0 || elapsed > 2500) {
+      setWizardMsg('That flash already went by — tap right as the screen flashes.')
+      return
+    }
+    // video moment on screen at tap instant = flash position + elapsed playback
+    // (+ small constant for the TV/element display pipeline)
+    const videoNowMs = f.mediaTsMs + elapsed + 40
+    const err = Math.round(probe.mediaTsMs - videoNowMs)
+    if (Math.abs(err) > 1500) { setWizardMsg('Odd reading — tap once more.'); return }
+    errsRef.current.push(err)
+    setWizardTaps(errsRef.current.length)
+    if (errsRef.current.length >= 3) finishWizard()
   }
 
   /* ------------------------------------------------------ visualizer */
@@ -268,7 +346,20 @@ export default function Listener({ sessionParam }: { sessionParam: string }) {
           </div>
         )}
 
-        {/* volume + offset */}
+        {/* auto lip-sync wizard */}
+        <button
+          onClick={startWizard}
+          className={`mt-4 w-full rounded-2xl border px-4 py-3 text-left text-sm font-semibold transition-colors ${
+            offset === 0
+              ? 'animate-pulse border-emerald-400/70 bg-emerald-500/15 text-emerald-200'
+              : 'border-zinc-700 bg-zinc-900/60 text-zinc-300 hover:border-emerald-500/50'
+          }`}
+        >
+          ⚡ Sync to screen
+          <span className="ml-2 text-xs font-normal text-zinc-500">tap when the TV flashes — corrected automatically</span>
+        </button>
+
+        {/* volume + nudge */}
         <div className="mt-4 space-y-3 rounded-2xl border border-zinc-800 bg-zinc-900/40 p-4">
           <div className="flex items-center gap-3">
             <span className="w-8 text-center text-sm" aria-hidden>🔊</span>
@@ -324,6 +415,19 @@ export default function Listener({ sessionParam }: { sessionParam: string }) {
           <p className="mt-3 text-center text-[10px] text-zinc-600">No sound? Turn the iPhone silent switch off.</p>
         )}
       </div>
+
+      {/* lip-sync calibration overlay */}
+      {wizard !== 'idle' && (
+        <WizardOverlay
+          mode={wizard === 'done' ? 'done' : 'tapping'}
+          taps={wizardTaps}
+          msg={wizardMsg}
+          result={wizardResult}
+          flashPulse={flashPulse}
+          onTap={wizardTap}
+          onCancel={() => setWizard('idle')}
+        />
+      )}
     </Shell>
   )
 }
@@ -332,6 +436,48 @@ function Shell({ children }: { children: React.ReactNode }) {
   return (
     <div className="flex min-h-screen flex-col items-center justify-center bg-[#08090c] px-4 py-8 text-zinc-200">
       {children}
+    </div>
+  )
+}
+
+function WizardOverlay(props: {
+  mode: 'tapping' | 'done'
+  taps: number
+  msg: string
+  result: number | null
+  flashPulse: boolean
+  onTap: () => void
+  onCancel: () => void
+}) {
+  return (
+    <div className="fixed inset-0 z-50 flex flex-col items-center justify-center bg-black/90 px-6 text-center">
+      {props.mode === 'tapping' ? (
+        <>
+          <div className="text-xs uppercase tracking-[0.3em] text-zinc-400">watch the TV screen</div>
+          <button
+            onClick={props.onTap}
+            className={`mt-8 grid h-44 w-44 place-items-center rounded-full border-4 text-lg font-bold leading-tight transition-all duration-100 ${
+              props.flashPulse
+                ? 'scale-105 border-white bg-white text-black'
+                : 'border-emerald-400 bg-emerald-500/10 text-emerald-200 active:scale-95'
+            }`}
+          >
+            TAP<br />on flash
+          </button>
+          <div className="mt-6 font-mono text-sm text-zinc-400">{props.taps} / 3 taps</div>
+          {props.msg && <div className="mt-3 max-w-xs text-xs text-amber-300">{props.msg}</div>}
+          <button onClick={props.onCancel} className="mt-6 text-xs text-zinc-500 underline hover:text-zinc-300">cancel</button>
+        </>
+      ) : (
+        <div className="rounded-3xl border border-emerald-500/40 bg-emerald-500/10 px-8 py-7">
+          <div className="text-3xl text-emerald-300">✓</div>
+          <div className="mt-2 text-lg font-bold text-emerald-200">Auto-synced</div>
+          <div className="mt-1 font-mono text-sm text-zinc-300">
+            lip-sync corrected {props.result != null ? `${props.result > 0 ? '+' : ''}${props.result}` : '0'} ms
+          </div>
+          <div className="mt-2 text-xs text-zinc-500">Saved for this session — re-run anytime lips drift.</div>
+        </div>
+      )}
     </div>
   )
 }

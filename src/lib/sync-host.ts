@@ -64,6 +64,7 @@ export class SyncHost {
   private onListenersCb: (rows: ListenerRow[]) => void = () => {}
   private onSessionCb: (info: { count: number }) => void = () => {}
   private onRelayCb: (connected: boolean) => void = () => {}
+  private onWizardRequestCb: (name: string) => void = () => {}
   private bitrateWindow: { t: number; bytes: number } = { t: 0, bytes: 0 }
   private bitrateKbps = 0
 
@@ -71,11 +72,13 @@ export class SyncHost {
     onListeners?: (rows: ListenerRow[]) => void
     onSession?: (info: { count: number }) => void
     onRelay?: (connected: boolean) => void
+    onWizardRequest?: (name: string) => void
   }) {
     this.sessionCode = sessionCode
     this.onListenersCb = cbs.onListeners || this.onListenersCb
     this.onSessionCb = cbs.onSession || this.onSessionCb
     this.onRelayCb = cbs.onRelay || this.onRelayCb
+    this.onWizardRequestCb = cbs.onWizardRequest || this.onWizardRequestCb
 
     this.ctx = new AudioContext({ sampleRate: this.sampleRate })
     this.zeroGain = this.ctx.createGain()
@@ -108,6 +111,9 @@ export class SyncHost {
     socket.on('sync:listener-joined-full', (d: { listener: ListenerRow }) => {
       this.statsRows.set(d.listener.id, d.listener)
       this.emitRows()
+    })
+    socket.on('sync:wizard', (d: { kind: string; name?: string }) => {
+      if (d?.kind === 'request') this.onWizardRequestCb(d.name || 'Listener')
     })
     if (socket.connected) { this.onRelayCb(true); this.onConnect() }
   }
@@ -231,11 +237,19 @@ export class SyncHost {
 
   private flushBatch(slot: TrackSlot) {
     if (!this.socket) return
+    // media-timeline position of the FIRST sample in this batch: the element's
+    // playhead minus the batch duration. Audio and video share this timeline,
+    // which is what lets listeners auto-align lips without any clock math.
+    const el = slot.element.currentTime
+    const mediaTsMs = Number.isFinite(el) && el > 0
+      ? Math.max(0, el * 1000 - (BATCH_SAMPLES / this.sampleRate) * 1000)
+      : 0
     const frame = encodeFrame({
       track: Number(slot.id),
       seq: slot.seq++,
       tsMs: performance.now(),
       sampleRate: this.sampleRate,
+      mediaTsMs,
       samples: slot.pending.slice(),
     })
     this.socket.emit('sync:audio', frame)
@@ -269,6 +283,14 @@ export class SyncHost {
         t.monitorGain.gain.value = enabled ? 1 : 0
       }
     })
+  }
+
+  /** Media-timeline position (ms) of the visible track's playhead right now. */
+  getVisibleMediaTime(): number | null {
+    const t = this.tracks.get('0')
+    if (!t) return null
+    const el = t.element.currentTime
+    return Number.isFinite(el) && el > 0 ? el * 1000 : null
   }
 
   async start() {

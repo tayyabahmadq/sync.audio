@@ -68,6 +68,11 @@ export default function HostConsole() {
       onListeners: (rows) => setListeners(rows),
       onSession: (info) => setCount(info.count),
       onRelay: (up) => setRelayUp(up),
+      // a listener tapped "Sync to screen" — flash the TV for them automatically
+      onWizardRequest: (name) => {
+        setWizardFor(name)
+        setTimeout(() => runWizardRef.current?.(), 80)
+      },
     })
     return () => {
       clearTimeout(t)
@@ -167,6 +172,33 @@ export default function HostConsole() {
     engineRef.current?.setMonitor(v)
   }
 
+  /* ------------------------------------------------- lip-sync wizard */
+  const [flash, setFlash] = useState(false)
+  const [wizardFor, setWizardFor] = useState<string | null>(null)
+  const wizardTimersRef = useRef<number[]>([])
+  const runWizardRef = useRef<(() => void) | null>(null)
+
+  const runWizard = useCallback(() => {
+    const engine = engineRef.current
+    if (!engine || !engine.broadcasting) return
+    wizardTimersRef.current.forEach((t) => clearTimeout(t))
+    wizardTimersRef.current = []
+    const total = 3
+    for (let i = 0; i < total; i++) {
+      wizardTimersRef.current.push(window.setTimeout(() => {
+        setFlash(true)
+        // tag the flash with the video playhead — listeners compare it with the
+        // media time they are actually hearing to compute the lip error
+        const mediaTs = engine.getVisibleMediaTime()
+        engine.socket?.emit('sync:wizard', { kind: 'flash', mediaTsMs: mediaTs ?? undefined, index: i, total })
+        wizardTimersRef.current.push(window.setTimeout(() => setFlash(false), 170))
+      }, i * 1400))
+    }
+    wizardTimersRef.current.push(window.setTimeout(() => setWizardFor(null), total * 1400 + 500))
+  }, [])
+  runWizardRef.current = runWizard
+  useEffect(() => () => { wizardTimersRef.current.forEach((t) => clearTimeout(t)) }, [])
+
   const copyLink = async () => {
     try {
       await navigator.clipboard.writeText(joinUrl)
@@ -197,6 +229,7 @@ export default function HostConsole() {
             )}
             {broadcast === 'paused' && <Pill tone="amber">PAUSED</Pill>}
             {broadcast === 'idle' && phase === 'live' && <Pill tone="zinc">STOPPED</Pill>}
+            {wizardFor && <Pill tone="fuchsia">calibrating {wizardFor}…</Pill>}
             <Pill tone="emerald">SESSION <span className="font-mono font-bold tracking-widest">{code}</span></Pill>
           </div>
         </div>
@@ -217,6 +250,8 @@ export default function HostConsole() {
               />
               {/* track B element — audio-only route, never shown */}
               <video ref={videoBRef} src={slotSrc[1]} playsInline preload="auto" className="hidden" aria-hidden />
+              {/* lip-sync wizard flash — this IS the TV picture during calibration */}
+              {flash && <div className="absolute inset-0 z-10 bg-white" aria-hidden />}
               {/* cover for audio-only sources */}
               {!slots[0].isVideo && (
                 <div className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center gap-4 bg-gradient-to-br from-zinc-950 via-black to-zinc-950">
@@ -251,6 +286,15 @@ export default function HostConsole() {
                 <Button onClick={pause} variant="outline" className="border-zinc-700">❚❚ Pause</Button>
               )}
               <Button onClick={stop} variant="outline" className="border-zinc-700">■ Stop</Button>
+              <Button
+                onClick={runWizard}
+                disabled={broadcast !== 'playing'}
+                variant="outline"
+                title={broadcast === 'playing' ? 'Flash the TV 3× so listeners can auto-align lips' : 'Start the broadcast first'}
+                className="border-fuchsia-500/40 text-fuchsia-300 hover:border-fuchsia-400 hover:text-fuchsia-200"
+              >
+                ⚡ Lip-sync wizard
+              </Button>
               <div className="ml-auto flex items-center gap-3 font-mono text-sm text-zinc-400">
                 <span className={broadcast === 'playing' ? 'text-rose-400' : ''}>{fmtElapsed(elapsed)}</span>
                 <label className="flex cursor-pointer items-center gap-2 text-xs normal-case">
@@ -363,7 +407,7 @@ export default function HostConsole() {
             <div className="mb-1 font-semibold text-amber-300">Stage notes</div>
             Keep this tab visible while broadcasting (the OS throttles hidden tabs).
             TV monitor is OFF by default — the room stays silent. Turn it on only to sanity-check the capture.
-            Each listener can nudge ±ms offset for perfect lip-sync against this screen.
+            For perfect lip-sync, listeners tap “⚡ Sync to screen” on their phone — this console flashes the TV 3× and the correction is applied automatically.
           </div>
         </section>
       </main>

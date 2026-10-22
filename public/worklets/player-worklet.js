@@ -14,6 +14,9 @@
  *    instant instead of converging over seconds via rate correction)
  *  - `skipMs` (device output latency, measured by the main thread) is skipped
  *    right after prefill, auto-compensating DAC/Bluetooth delay
+ *  - tracks the media-timeline position (video clock) of the audio currently
+ *    playout-ing, and answers `probe` requests on demand — the data behind the
+ *    one-tap automatic lip-sync wizard
  *  - linear-interpolation resampling if the device AudioContext runs at a
  *    different rate than the broadcast stream
  */
@@ -34,6 +37,7 @@ class SyncPlayer extends AudioWorkletProcessor {
     this.starveCount = 0
     this.primed = false     // prefill gate: stay silent until buffer is healthy
     this.fadeN = 0          // fade-in samples remaining (click killer)
+    this.lastMediaTsEnd = 0 // media-timeline ms of the newest buffered sample
     this.blockCount = 0
     this.lastStatBlock = 0
     this.port.onmessage = (e) => this.onMessage(e.data)
@@ -42,7 +46,7 @@ class SyncPlayer extends AudioWorkletProcessor {
   onMessage(msg) {
     if (!msg) return
     if (msg.type === 'chunk' && msg.samples) {
-      this.push(msg.samples)
+      this.push(msg.samples, msg.mediaTs)
     } else if (msg.type === 'clear') {
       this.writeIdx = 0
       this.readIdx = 0
@@ -52,11 +56,18 @@ class SyncPlayer extends AudioWorkletProcessor {
       this.adj = 0
       this.primed = false
       this.fadeN = 0
+      this.lastMediaTsEnd = 0
     } else if (msg.type === 'target') {
       this.targetMs = Math.max(40, Math.min(1000, msg.targetMs))
     } else if (msg.type === 'nudge') {
       const d = Math.max(-500, Math.min(500, msg.deltaMs || 0))
       if (d !== 0) this.applyNudge(Math.round((d / 1000) * this.streamRate))
+    } else if (msg.type === 'probe') {
+      // media-timeline position of the sample currently reaching the ear + fill
+      const mediaTs = this.lastMediaTsEnd > 0
+        ? this.lastMediaTsEnd - (this.filled / this.streamRate) * 1000
+        : null
+      this.port.postMessage({ type: 'playout', requestId: msg.requestId, mediaTsMs: mediaTs, fillMs: (this.filled / this.streamRate) * 1000 })
     }
   }
 
@@ -76,10 +87,13 @@ class SyncPlayer extends AudioWorkletProcessor {
     this.fadeN = Math.max(this.fadeN, 128)
   }
 
-  push(samples) {
+  push(samples, mediaTs) {
     const n = samples.length
     const cap = this.ring.length
     if (n >= cap) return // absurd frame, drop
+    if (typeof mediaTs === 'number' && mediaTs > 0) {
+      this.lastMediaTsEnd = mediaTs + (n / this.streamRate) * 1000
+    }
     // drop oldest if we would overrun
     if (this.filled + n > cap) {
       const drop = this.filled + n - cap
@@ -201,6 +215,9 @@ class SyncPlayer extends AudioWorkletProcessor {
         adj: this.adj,
         targetMs: this.targetMs,
         skipMs: (this.skipSamples / this.streamRate) * 1000,
+        playoutMediaTs: this.lastMediaTsEnd > 0
+          ? this.lastMediaTsEnd - (this.filled / this.streamRate) * 1000
+          : null,
       })
     }
   }
