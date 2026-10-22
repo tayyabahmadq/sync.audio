@@ -1,0 +1,13 @@
+{
+  "name": "Sync.audio — silent group listening",
+  "short_name": "Sync.audio",
+  "description": "Scan the TV's QR code and hear the broadcast in your own earbuds — in perfect sync, zero install.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#08090c",
+  "theme_color": "#08090c",
+  "icons": [
+    { "src": "/icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "/icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" }
+  ]
+}
