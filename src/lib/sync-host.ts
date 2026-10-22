@@ -2,12 +2,19 @@
  * Sync.audio — host-side engine ("the TV")
  *
  * Captures the master audio of playing media elements through the Web Audio
- * graph (mono, 48 kHz), batches it into ~43 ms PCM frames, stamps each frame
- * with the host session clock and streams it to the relay, which fans it out
- * to every listener in the session room.
+ * graph (mono, 48 kHz), batches it into ~21 ms Int16 PCM frames and streams
+ * them to the relay, which fans them out to every listener in the session
+ * room.
+ *
+ * v2: capture runs in an AudioWorklet on the dedicated audio thread (immune
+ * to main-thread UI jank — the #1 host-side cause of listener starvation),
+ * with a ScriptProcessor fallback. Batches halved 2048→1024 samples and the
+ * wire payload halved Float32→Int16, cutting air latency ~22 ms and Wi-Fi
+ * airtime ~50%.
  */
 import { encodeFrame } from '@/lib/sync-protocol'
 import { createRelaySocket } from '@/lib/relay-socket'
+import type { Socket } from 'socket.io-client'
 
 export interface TrackMeta {
   id: string
@@ -34,14 +41,14 @@ interface TrackSlot {
   name: string
   element: HTMLMediaElement
   source: MediaElementAudioSourceNode
-  processor: ScriptProcessorNode
+  capture: AudioWorkletNode | ScriptProcessorNode
   monitorGain: GainNode
   pending: Float32Array
   pendingFill: number
   seq: number
 }
 
-const BATCH_SAMPLES = 2048 // ~43 ms @ 48 kHz
+const BATCH_SAMPLES = 1024 // ~21 ms @ 48 kHz
 
 export class SyncHost {
   socket: Socket | null = null
@@ -53,6 +60,7 @@ export class SyncHost {
   startedAt = 0
 
   private zeroGain: GainNode | null = null
+  private captureModule: Promise<boolean> | null = null
   private onListenersCb: (rows: ListenerRow[]) => void = () => {}
   private onSessionCb: (info: { count: number }) => void = () => {}
   private onRelayCb: (connected: boolean) => void = () => {}
@@ -73,6 +81,9 @@ export class SyncHost {
     this.zeroGain = this.ctx.createGain()
     this.zeroGain.gain.value = 0
     this.zeroGain.connect(this.ctx.destination)
+
+    // warm the capture worklet module so attachTrack can use it synchronously
+    this.ensureCaptureModule()
 
     void createRelaySocket().then((socket) => {
       this.socket = socket
@@ -124,8 +135,18 @@ export class SyncHost {
     this.onListenersCb(Array.from(this.statsRows.values()))
   }
 
+  private ensureCaptureModule(): Promise<boolean> {
+    if (!this.captureModule) {
+      this.captureModule = this.ctx!.audioWorklet
+        .addModule('/worklets/capture-worklet.js')
+        .then(() => true)
+        .catch(() => false)
+    }
+    return this.captureModule
+  }
+
   /** Attach a media element as a broadcast track. One source node per element, ever. */
-  attachTrack(id: string, name: string, element: HTMLMediaElement) {
+  async attachTrack(id: string, name: string, element: HTMLMediaElement) {
     if (!this.ctx || !this.zeroGain) return
     if (this.tracks.has(id)) {
       this.pushTracks()
@@ -137,39 +158,63 @@ export class SyncHost {
     source.channelCountMode = 'explicit'
     source.channelInterpretation = 'speakers'
 
-    const processor = this.ctx.createScriptProcessor(BATCH_SAMPLES / 2, 1, 1)
     const monitorGain = this.ctx.createGain()
     monitorGain.gain.value = 0
-    source.connect(processor)
     source.connect(monitorGain)
     monitorGain.connect(this.ctx.destination)
-    processor.connect(this.zeroGain)
 
     const slot: TrackSlot = {
-      id, name, element, source, processor, monitorGain,
+      id, name, element, source, monitorGain,
+      capture: null as unknown as AudioWorkletNode | ScriptProcessorNode,
       pending: new Float32Array(BATCH_SAMPLES),
       pendingFill: 0,
       seq: 0,
     }
 
-    processor.onaudioprocess = (ev) => {
-      if (!this.broadcasting) return
-      const input = ev.inputBuffer.getChannelData(0)
-      let copied = 0
-      while (copied < input.length) {
-        const room = BATCH_SAMPLES - slot.pendingFill
-        const take = Math.min(room, input.length - copied)
-        slot.pending.set(input.subarray(copied, copied + take), slot.pendingFill)
-        slot.pendingFill += take
-        copied += take
-        if (slot.pendingFill === BATCH_SAMPLES) {
-          this.flushBatch(slot)
-        }
-      }
+    // Preferred: audio-thread capture (glitch-free under UI load).
+    let capture: AudioWorkletNode | ScriptProcessorNode | null = null
+    if (await this.ensureCaptureModule()) {
+      try {
+        const node = new AudioWorkletNode(this.ctx, 'sync-capture', {
+          numberOfInputs: 1,
+          numberOfOutputs: 0,
+          channelCount: 1,
+          channelCountMode: 'explicit',
+          processorOptions: { batch: BATCH_SAMPLES },
+        })
+        node.port.onmessage = (e) => this.ingest(slot, e.data as Float32Array)
+        source.connect(node)
+        capture = node
+      } catch { /* fall through to ScriptProcessor */ }
     }
+    // Fallback: main-thread ScriptProcessor (old WebViews / headless CI).
+    if (!capture) {
+      const sp = this.ctx.createScriptProcessor(BATCH_SAMPLES / 2, 1, 1)
+      sp.onaudioprocess = (ev) => this.ingest(slot, ev.inputBuffer.getChannelData(0))
+      source.connect(sp)
+      sp.connect(this.zeroGain)
+      capture = sp
+    }
+    slot.capture = capture
 
     this.tracks.set(id, slot)
     this.pushTracks()
+  }
+
+  /** Accumulate captured samples into BATCH_SAMPLES frames and ship them. */
+  private ingest(slot: TrackSlot, input: Float32Array) {
+    if (!this.broadcasting) return
+    let copied = 0
+    while (copied < input.length) {
+      const room = BATCH_SAMPLES - slot.pendingFill
+      const take = Math.min(room, input.length - copied)
+      slot.pending.set(input.subarray(copied, copied + take), slot.pendingFill)
+      slot.pendingFill += take
+      copied += take
+      if (slot.pendingFill === BATCH_SAMPLES) {
+        this.flushBatch(slot)
+      }
+    }
   }
 
   setTrackName(id: string, name: string) {
@@ -209,7 +254,7 @@ export class SyncHost {
 
   getStats(): HostStats {
     let frames = 0, bytes = 0
-    this.tracks.forEach((t) => { frames += t.seq; bytes += t.seq * (24 + BATCH_SAMPLES * 4) })
+    this.tracks.forEach((t) => { frames += t.seq; bytes += t.seq * (24 + BATCH_SAMPLES * 2) })
     return {
       framesSent: frames,
       bytesSent: bytes,
@@ -257,8 +302,8 @@ export class SyncHost {
   private wakeLock: { release: () => Promise<void> } | null = null
   private async requestWakeLock() {
     try {
-      // @ts-expect-error experimental API
-      this.wakeLock = await navigator.wakeLock.request('screen')
+      const nav = navigator as Navigator & { wakeLock?: { request: (t: string) => Promise<{ release: () => Promise<void> }> } }
+      this.wakeLock = await nav.wakeLock?.request('screen') ?? null
     } catch { /* not supported */ }
   }
 
@@ -266,7 +311,7 @@ export class SyncHost {
     this.stop()
     try { this.wakeLock?.release() } catch { /* */ }
     this.socket?.disconnect()
-    this.tracks.forEach((t) => { t.processor.disconnect(); t.source.disconnect() })
+    this.tracks.forEach((t) => { try { t.capture.disconnect() } catch { /* */ }; t.source.disconnect() })
     this.tracks.clear()
     this.ctx?.close()
   }

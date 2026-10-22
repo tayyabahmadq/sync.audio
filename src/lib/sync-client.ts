@@ -2,12 +2,16 @@
  * Sync.audio — listener-side engine ("the earbud receiver")
  *
  * Joins a session over the relay, then:
- *  1. runs an NTP-style clock sync against the relay (offset + RTT display)
- *  2. receives binary PCM frames and feeds the AudioWorklet jitter buffer
- *  3. reports buffer health back to the host console
+ *  1. runs an NTP-style clock sync against the relay (burst + median seeding)
+ *  2. receives binary Int16 PCM frames and feeds the AudioWorklet jitter buffer
+ *  3. measures network jitter and adapts the jitter target (70–300 ms)
+ *  4. auto-compensates the device output latency (DAC/Bluetooth) by skipping
+ *     that much audio right after prefill
+ *  5. applies instant lip-sync nudges and reports buffer health to the host
  */
 import { decodeFrame } from '@/lib/sync-protocol'
 import { createRelaySocket } from '@/lib/relay-socket'
+import type { Socket } from 'socket.io-client'
 
 export interface TrackMeta {
   id: string
@@ -24,6 +28,9 @@ export interface ClientStatus {
   rtt: number | null
   offsetMs: number | null
   bufferMs: number | null
+  jitterMs: number | null
+  targetMs: number | null
+  skipMs: number | null
   starving: boolean
   frames: number
   drops: number
@@ -39,8 +46,9 @@ export class SyncClient {
   listenerName = 'Listener'
   streamSampleRate = 48000
   currentTrack = 0
-  targetMs = 160
-  userOffsetMs = 0
+  targetMs = 140 // initial jitter target; adapts 70–300 ms from measured jitter
+  currentTargetMs = 140
+  appliedOffsetMs = 0 // accumulated lip-sync nudges
   audioStarted = false
   private lastSeq = new Map<number, number>()
   private statsTimer: ReturnType<typeof setInterval> | null = null
@@ -48,6 +56,12 @@ export class SyncClient {
   private drops = 0
   private offsetEma: number | null = null
   private rttEma: number | null = null
+  private lastArrival: number | null = null
+  private arrMean: number | null = null
+  private jitterMs: number | null = null
+  private lastStarveAt = 0
+  private audioStartedAt = 0
+  private skipMs = 0
 
   onStatus: (s: Partial<ClientStatus>) => void = () => {}
   onAudioFrame: () => void = () => {}
@@ -63,6 +77,9 @@ export class SyncClient {
       rtt: this.rttEma,
       offsetMs: this.offsetEma,
       bufferMs: this.bufferNow,
+      jitterMs: this.jitterMs != null ? Math.round(this.jitterMs) : null,
+      targetMs: Math.round(this.currentTargetMs),
+      skipMs: Math.round(this.skipMs),
       starving: this.starvingNow,
       frames: this.frames,
       drops: this.drops,
@@ -130,12 +147,43 @@ export class SyncClient {
         this.hostState = resp.session.state
         this.streamSampleRate = resp.session.sampleRate || 48000
         this.onStatus({ joined: true, tracks: this.tracks, hostState: this.hostState, sampleRate: this.streamSampleRate })
+        this.burstTimesync()
       } else {
         this.onStatus({ joined: false })
         this.joinError = resp?.message || 'Could not join session'
         this.onJoinError?.(this.joinError)
       }
     })
+  }
+
+  /** NTP-style burst: 5 probes, median offset — converges the clock readout instantly. */
+  private burstTimesync() {
+    const offsets: number[] = []
+    const rtts: number[] = []
+    let n = 0
+    const median = (arr: number[]) => {
+      const s = [...arr].sort((a, b) => a - b)
+      return s[Math.floor(s.length / 2)]
+    }
+    const fire = () => {
+      const c0 = Date.now()
+      this.socket?.timeout(2500).emit('sync:timesync', { c0 }, (err: unknown, resp: { c0: number; s: number } | undefined) => {
+        if (!err && resp) {
+          const c3 = Date.now()
+          const rtt = c3 - resp.c0
+          rtts.push(rtt)
+          offsets.push(resp.s + rtt / 2 - c3)
+        }
+        if (++n < 5) {
+          setTimeout(fire, 80)
+        } else if (offsets.length) {
+          this.rttEma = median(rtts)
+          this.offsetEma = median(offsets)
+          this.onStatus({ rtt: Math.round(this.rttEma), offsetMs: Math.round(this.offsetEma) })
+        }
+      })
+    }
+    fire()
   }
 
   /** Must be called from a user gesture (mobile autoplay policy). */
@@ -169,6 +217,30 @@ export class SyncClient {
 
     this.ctx = ctx
     this.audioStarted = true
+    this.audioStartedAt = Date.now()
+
+    // Device output-latency compensation: Chrome exposes baseLatency (audio
+    // HAL) and outputLatency (playout pipeline, includes some Bluetooth delay).
+    // Skipping that much audio right after prefill removes it from the
+    // air-latency chain; manual nudges only need to fix the residual.
+    const lat = ctx as AudioContext & { baseLatency?: number; outputLatency?: number }
+    this.skipMs = Math.max(0, Math.min(400, Math.round(((lat.baseLatency || 0) + (lat.outputLatency || 0)) * 1000)))
+    if (this.node && this.skipMs > 0) {
+      this.node.port.postMessage({ type: 'nudge', deltaMs: -this.skipMs })
+      this.onStatus({ skipMs: this.skipMs })
+    }
+    // outputLatency often settles ~1 s after the sink wakes — top up once.
+    setTimeout(() => {
+      if (!this.audioStarted || !this.ctx) return
+      const l2 = this.ctx as AudioContext & { baseLatency?: number; outputLatency?: number }
+      const total = Math.max(0, Math.min(400, Math.round(((l2.baseLatency || 0) + (l2.outputLatency || 0)) * 1000)))
+      const extra = total - this.skipMs
+      if (extra > 15) {
+        this.skipMs = total
+        this.nudgeOffsetMs(-extra)
+        this.onStatus({ skipMs: this.skipMs })
+      }
+    }, 1200)
 
     // iOS: silent-switch workaround — an inaudible looping element keeps the
     // audio session in "playback" mode on some iOS versions.
@@ -191,14 +263,16 @@ export class SyncClient {
       numberOfInputs: 0,
       numberOfOutputs: 1,
       outputChannelCount: [1],
-      processorOptions: { streamRate: this.streamSampleRate, targetMs: this.targetMs + this.userOffsetMs },
+      processorOptions: { streamRate: this.streamSampleRate, targetMs: this.targetMs },
     })
     node.port.onmessage = (e) => {
       const d = e.data
       if (d?.type === 'stats') {
         this.bufferNow = d.fillMs
         this.starvingNow = !!d.starving
-        this.onStatus({ bufferMs: d.fillMs, starving: !!d.starving, streaming: !d.starving })
+        if (d.starving) this.lastStarveAt = Date.now()
+        if (typeof d.targetMs === 'number') this.currentTargetMs = d.targetMs
+        this.onStatus({ bufferMs: d.fillMs, starving: !!d.starving, streaming: !d.starving, targetMs: Math.round(this.currentTargetMs) })
       }
     }
     const gain = ctx.createGain()
@@ -228,7 +302,14 @@ export class SyncClient {
       const ring = new Float32Array(cap)
       let write = 0, read = 0, filled = 0, adj = 0, block = 0
       let primed = false
-      const targetBase = (this.targetMs + this.userOffsetMs) / 1000 * this.streamSampleRate
+      // live target: adaptive updates from the main thread reach the fallback too
+      let targetSamples = (this.currentTargetMs / 1000) * this.streamSampleRate
+      this.fallbackTarget = (ms: number) => { targetSamples = (ms / 1000) * this.streamSampleRate }
+      this.fallbackNudge = (deltaMs: number) => {
+        const s = Math.round((deltaMs / 1000) * this.streamSampleRate)
+        if (s < 0) { const skip = Math.min(-s, filled); read = (read + skip) % cap; filled -= skip }
+        else { const back = Math.min(s, filled); read = (read - back + cap * 2) % cap; filled += back }
+      }
 
       this.fallbackPush = (samples: Float32Array) => {
         const n = samples.length
@@ -247,7 +328,7 @@ export class SyncClient {
 
       sp.onaudioprocess = (ev) => {
         const out = ev.outputBuffer.getChannelData(0)
-        const target = targetBase
+        const target = targetSamples
         const err = filled - target
         adj = adj * 0.995 + Math.max(-0.03, Math.min(0.03, err / (this.streamSampleRate * 3))) * 0.005
         const step = (this.streamSampleRate / rate) * (1 + adj)
@@ -313,11 +394,24 @@ export class SyncClient {
 
   private fallbackPush: ((s: Float32Array) => void) | null = null
   private fallbackNode: ScriptProcessorNode | null = null
+  private fallbackTarget: ((ms: number) => void) | null = null
+  private fallbackNudge: ((deltaMs: number) => void) | null = null
 
   private handleAudio(buf: ArrayBuffer) {
     const frame = decodeFrame(buf)
     if (!frame) return
     this.frames++
+    // network jitter measurement: deviation of frame inter-arrival time
+    const now = performance.now()
+    if (this.lastArrival != null && frame.track === this.currentTrack) {
+      const dt = now - this.lastArrival
+      if (dt > 1 && dt < 800) {
+        this.arrMean = this.arrMean == null ? dt : this.arrMean + (dt - this.arrMean) * 0.05
+        const dev = Math.abs(dt - this.arrMean)
+        this.jitterMs = this.jitterMs == null ? dev : this.jitterMs + (dev - this.jitterMs) * 0.12
+      }
+    }
+    this.lastArrival = now
     const last = this.lastSeq.get(frame.track)
     if (last != null && frame.seq > last + 1 && frame.seq - last < 50) this.drops += frame.seq - last - 1
     this.lastSeq.set(frame.track, frame.seq)
@@ -345,9 +439,13 @@ export class SyncClient {
     if (this.gain) this.gain.gain.value = v
   }
 
-  setOffsetMs(ms: number) {
-    this.userOffsetMs = ms
-    this.node?.port.postMessage({ type: 'target', targetMs: this.targetMs + ms })
+  /** Instant lip-sync nudge. Positive = audio later; negative = audio earlier. */
+  nudgeOffsetMs(deltaMs: number) {
+    const d = Math.max(-500, Math.min(500, Math.round(deltaMs)))
+    if (!d) return
+    this.appliedOffsetMs += d
+    this.node?.port.postMessage({ type: 'nudge', deltaMs: d })
+    this.fallbackNudge?.(d)
   }
 
   private startTimers() {
@@ -364,6 +462,22 @@ export class SyncClient {
         this.offsetEma = this.offsetEma == null ? offset : this.offsetEma * 0.8 + offset * 0.2
         this.onStatus({ rtt: Math.round(this.rttEma), offsetMs: Math.round(this.offsetEma) })
       })
+      // adaptive jitter target: sized from measured network jitter; shrinks
+      // only after 8 s of stable playout so it never fights a real problem
+      if (this.audioStarted && this.node) {
+        const stableMs = Date.now() - Math.max(this.lastStarveAt, this.audioStartedAt)
+        const jitter = this.jitterMs ?? 0
+        const period = Math.max(5, Math.min(60, this.arrMean || 21))
+        let want = Math.round(2.8 * jitter + period + 50)
+        want = Math.max(70, Math.min(300, want))
+        const cur = this.currentTargetMs
+        if (want > cur + 5 || (want < cur - 5 && stableMs > 8000)) {
+          this.currentTargetMs = want
+          this.node?.port.postMessage({ type: 'target', targetMs: want })
+          this.fallbackTarget?.(want)
+          this.onStatus({ targetMs: want })
+        }
+      }
       // report health to host
       this.socket?.emit('sync:stats', {
         rtt: this.rttEma != null ? Math.round(this.rttEma) : undefined,

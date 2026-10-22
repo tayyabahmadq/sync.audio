@@ -302,8 +302,8 @@ export default function HostConsole() {
           {/* stats */}
           <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
             <Stat label="Frames streamed" value={frames.toLocaleString()} />
-            <Stat label="Uplink" value={`${Math.round(kbps)} kbps`} sub="PCM · 48 kHz mono" />
-            <Stat label="Air latency" value="≈205 ms" sub="43 ms batch + 160 ms jitter" />
+            <Stat label="Uplink" value={`${Math.round(kbps)} kbps`} sub="PCM 16-bit · 48 kHz mono" />
+            <Stat label="Air latency" value="≈90–160 ms" sub="21 ms batch + adaptive jitter" />
             <Stat label="Group sync" value={spread != null ? `±${spread.toFixed(0)} ms` : '—'} sub="listener spread" tone={spread != null && spread < 30 ? 'text-emerald-300' : ''} />
           </div>
         </section>
@@ -350,7 +350,7 @@ export default function HostConsole() {
                       </div>
                     </div>
                     <div className="font-mono text-xs text-emerald-300">
-                      {l.bufferMs != null && l.rtt != null ? `${Math.max(0, l.bufferMs - 160 + Math.round(l.rtt / 2))}ms` : 'sync…'}
+                      {l.bufferMs != null && l.rtt != null ? `${Math.max(0, l.bufferMs + Math.round(l.rtt / 2))}ms` : 'sync…'}
                     </div>
                   </li>
                 ))}

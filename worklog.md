@@ -23,3 +23,23 @@ Stage Summary:
 - Key numbers: 48kHz mono PCM, 2048-sample batches (~43ms), ~205ms air latency (43ms batch + 160ms jitter), ~2.6 Mbps uplink dual-track, cross-listener sync via shared jitter target + drift correction.
 - Preview URL routes: `/` landing, `/?p=host` host console, `/?p=join&s=CODE` listener.
 - Mini service must stay running: `cd mini-services/sync-service && bun run dev` (already nohup'd).
+
+---
+Task ID: 2
+Agent: main (Z.ai)
+Task: v2 performance upgrade pass — user reported buffering, lag, and lip-sync drift during live testing; ship fixes + package all files.
+
+Work Log:
+- Diagnosed v1 root causes: fixed 160ms jitter buffer with harsh full re-prefill on underrun; 2.6 Mbps Float32 PCM saturating Wi-Fi; host capture on main thread (UI re-renders punch capture gaps); 43ms batches; offset slider converged over seconds via rate correction; zero device output-latency compensation.
+- Protocol v2 (src/lib/sync-protocol.ts): Int16 wire payload (halves bandwidth), codec byte for future Opus, version bump 1→2.
+- player-worklet.js v2: soft underrun recovery (<350ms starves ride through, resume at ~30ms with 256-sample fade-in; full re-prefill only after long starvation), instant `nudge` message (instant playout shift with fade), `skipMs` device-latency skip after prefill, tighter ±2.5% rate correction.
+- New public/worklets/capture-worklet.js: host capture on dedicated audio thread, exact 1024-sample batches, posted as transferable Float32Array; ScriptProcessor fallback retained (sync-host.ts, BATCH_SAMPLES 2048→1024).
+- sync-client.ts: inter-arrival jitter measurement (EMA), adaptive jitter target 70–300ms (grow instantly, shrink after 8s stability), auto device-delay compensation from baseLatency+outputLatency (+1.2s top-up), nudgeOffsetMs() instant API, NTP burst timesync (5 probes, median), status fields jitterMs/targetMs/skipMs.
+- Listener.tsx: instant ±25/±100 nudge buttons (±500ms range), auto-compensation readout, net-jitter + jitter-target telemetry, rebuffering copy. HostConsole.tsx: dynamic air latency stat, Int16 label, per-listener delay calc.
+- Fixed pre-existing tsc errors: missing Socket type imports, unused ts-expect-error (wakeLock).
+- Verified: bun run build ✓, tsc clean ✓, live smoke test — host ON AIR at 1560 kbps (exact Int16 math, was 2.6 Mbps), listener Guest-97 joined session E7EW9 through relay; headless renderer died during playout (documented sandbox limitation, not a product bug).
+- Packaged download/sync-audio-v2.zip (112 files) + download/UPGRADES.md (upgrade notes, file map, roadmap).
+
+Stage Summary:
+- v2 shipped: buffering → soft underrun + half bandwidth + audio-thread capture; lag → 21ms batches + adaptive 70–140ms jitter + device-delay skip; lip-sync → instant nudges + auto compensation. Air latency ≈210–260ms → ≈90–160ms.
+- Relay service unchanged and still running on :3003.

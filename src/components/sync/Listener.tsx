@@ -24,7 +24,7 @@ export default function Listener({ sessionParam }: { sessionParam: string }) {
   const [status, setStatus] = useState<ClientStatus>({
     connected: false, joined: false, streaming: false, hostState: 'idle',
     sampleRate: 48000, tracks: [], rtt: null, offsetMs: null, bufferMs: null,
-    starving: true, frames: 0, drops: 0,
+    jitterMs: null, targetMs: null, skipMs: null, starving: true, frames: 0, drops: 0,
   })
 
   const clientRef = useRef<SyncClient | null>(null)
@@ -66,7 +66,6 @@ export default function Listener({ sessionParam }: { sessionParam: string }) {
     if (ok) {
       analyserRef.current = c.analyser
       c.setVolume(volume)
-      c.setOffsetMs(offset)
       setStage('live')
     } else {
       setError('Could not start audio engine on this device.')
@@ -140,10 +139,11 @@ export default function Listener({ sessionParam }: { sessionParam: string }) {
     clientRef.current?.switchTrack(id)
   }
   const changeVolume = (v: number) => { setVolume(v); clientRef.current?.setVolume(v) }
+  // instant lip-sync nudge: positive delays audio, negative advances it
   const nudge = (d: number) => {
-    const next = Math.max(-250, Math.min(250, offset + d))
+    const next = Math.max(-500, Math.min(500, offset + d))
     setOffset(next)
-    clientRef.current?.setOffsetMs(next)
+    clientRef.current?.nudgeOffsetMs(next - offset)
   }
 
   const live = status.hostState === 'playing'
@@ -237,7 +237,7 @@ export default function Listener({ sessionParam }: { sessionParam: string }) {
           <canvas ref={canvasRef} className="h-64 w-full" aria-hidden />
           <div className="pointer-events-none absolute inset-x-0 bottom-3 text-center">
             <div className="font-mono text-[10px] uppercase tracking-[0.25em] text-zinc-500">
-              {status.streaming ? 'receiving · in sync' : live ? 'buffering…' : paused ? 'host paused' : 'waiting for host to start'}
+              {status.streaming ? 'receiving · in sync' : live ? 'rebuffering — holding sync…' : paused ? 'host paused' : 'waiting for host to start'}
             </div>
           </div>
         </div>
@@ -280,27 +280,34 @@ export default function Listener({ sessionParam }: { sessionParam: string }) {
             />
           </div>
           <div className="flex items-center justify-between gap-2">
-            <span className="text-[10px] uppercase tracking-[0.15em] text-zinc-500">Lip-sync offset</span>
-            <div className="flex items-center gap-2">
-              <Button variant="outline" size="sm" onClick={() => nudge(-25)} className="h-7 border-zinc-700 px-2.5 font-mono text-xs">−</Button>
+            <span className="text-[10px] uppercase tracking-[0.15em] text-zinc-500">Lip-sync nudge</span>
+            <div className="flex items-center gap-1.5">
+              <Button variant="outline" size="sm" onClick={() => nudge(-100)} className="h-7 border-zinc-700 px-2 font-mono text-[10px]">−100</Button>
+              <Button variant="outline" size="sm" onClick={() => nudge(-25)} className="h-7 border-zinc-700 px-2 font-mono text-[10px]">−25</Button>
               <span className={`w-16 text-center font-mono text-xs ${offset === 0 ? 'text-zinc-400' : 'text-emerald-300'}`}>
                 {offset > 0 ? '+' : ''}{offset} ms
               </span>
-              <Button variant="outline" size="sm" onClick={() => nudge(25)} className="h-7 border-zinc-700 px-2.5 font-mono text-xs">+</Button>
+              <Button variant="outline" size="sm" onClick={() => nudge(25)} className="h-7 border-zinc-700 px-2 font-mono text-[10px]">+25</Button>
+              <Button variant="outline" size="sm" onClick={() => nudge(100)} className="h-7 border-zinc-700 px-2 font-mono text-[10px]">+100</Button>
               {offset !== 0 && (
-                <button onClick={() => nudge(-offset)} className="text-[10px] text-zinc-500 underline hover:text-zinc-300">reset</button>
+                <button onClick={() => nudge(-offset)} className="ml-0.5 text-[10px] text-zinc-500 underline hover:text-zinc-300">reset</button>
               )}
             </div>
           </div>
+          {status.skipMs != null && status.skipMs > 0 && (
+            <div className="text-[10px] leading-relaxed text-zinc-500">
+              Device delay auto-compensated: <span className="font-mono text-emerald-400">{status.skipMs} ms</span> (DAC/Bluetooth). Use the nudges if voices still trail the picture.
+            </div>
+          )}
         </div>
 
         {/* telemetry */}
         <div className="mt-4 grid grid-cols-4 gap-2 text-center">
           {[
             { l: 'buffer', v: status.bufferMs != null ? `${Math.round(status.bufferMs)}` : '—', u: 'ms' },
+            { l: 'net jitter', v: status.jitterMs != null ? `${status.jitterMs}` : '—', u: 'ms' },
             { l: 'rtt', v: status.rtt != null ? `${status.rtt}` : '—', u: 'ms' },
-            { l: 'clock Δ', v: status.offsetMs != null ? `${status.offsetMs}` : '—', u: 'ms' },
-            { l: 'rate', v: `${Math.round(status.sampleRate / 1000)}k`, u: 'Hz' },
+            { l: 'jitter tgt', v: status.targetMs != null ? `${status.targetMs}` : '—', u: 'ms' },
           ].map((s) => (
             <div key={s.l} className="rounded-xl border border-zinc-800 bg-zinc-900/40 py-2">
               <div className="font-mono text-sm font-semibold text-zinc-100">{s.v}<span className="text-[9px] text-zinc-500">{s.u}</span></div>
