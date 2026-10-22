@@ -34,6 +34,10 @@ export interface ClientStatus {
   starving: boolean
   frames: number
   drops: number
+  driftMs: number | null
+  autoEngaged: boolean
+  autoLocked: boolean
+  autoFixedMs: number
 }
 
 export class SyncClient {
@@ -46,8 +50,8 @@ export class SyncClient {
   listenerName = 'Listener'
   streamSampleRate = 48000
   currentTrack = 0
-  targetMs = 140 // initial jitter target; adapts 70–300 ms from measured jitter
-  currentTargetMs = 140
+  targetMs = 110 // initial jitter target; adapts 70–300 ms from measured jitter
+  currentTargetMs = 110
   appliedOffsetMs = 0 // accumulated lip-sync nudges
   audioStarted = false
   private lastSeq = new Map<number, number>()
@@ -84,6 +88,10 @@ export class SyncClient {
       starving: this.starvingNow,
       frames: this.frames,
       drops: this.drops,
+      driftMs: this.driftMs,
+      autoEngaged: this.autoEngaged,
+      autoLocked: this.autoLocked,
+      autoFixedMs: this.autoFixedMs,
     }
   }
 
@@ -92,6 +100,15 @@ export class SyncClient {
   private tracks: TrackMeta[] = []
   private bufferNow: number | null = null
   private starvingNow = true
+
+  /* -------------------------------------------------- auto-sync (v3) state */
+  private beacon: { mediaTsMs: number; relayTs: number } | null = null
+  private driftMs: number | null = null
+  private autoEngaged = false
+  private autoLocked = false
+  private autoFixedMs = 0
+  private autoPausedUntil = 0
+  private lastRelockAt = 0
 
   connect(sessionCode: string, listenerName: string) {
     this.sessionCode = sessionCode.toUpperCase().trim()
@@ -105,6 +122,7 @@ export class SyncClient {
       socket.on('connect', () => {
         this.onStatus({ connected: true })
         this.join()
+        this.startTimers()
       })
       socket.on('disconnect', () => this.onStatus({ connected: false, joined: false }))
       socket.on('sync:audio', (buf: ArrayBuffer) => this.handleAudio(buf))
@@ -118,6 +136,13 @@ export class SyncClient {
       socket.on('sync:tracks', (d: { tracks: TrackMeta[] }) => {
         this.tracks = d.tracks || []
         this.onStatus({ tracks: this.tracks })
+      })
+      // sync beacon (v3): the host's 1 s heartbeat, re-stamped by the relay
+      // with the shared wall-clock. Drives the automatic lip-sync loop below.
+      socket.on('sync:beacon', (d: { mediaTsMs?: number; state?: string; relayTs?: number }) => {
+        if (typeof d?.mediaTsMs === 'number' && d.mediaTsMs > 0 && typeof d.relayTs === 'number') {
+          this.beacon = { mediaTsMs: d.mediaTsMs, relayTs: d.relayTs }
+        }
       })
       socket.on('sync:host-gone', () => {
         this.hostState = 'idle'
@@ -454,13 +479,70 @@ export class SyncClient {
     if (this.gain) this.gain.gain.value = v
   }
 
-  /** Instant lip-sync nudge. Positive = audio later; negative = audio earlier. */
-  nudgeOffsetMs(deltaMs: number) {
-    const d = Math.max(-600, Math.min(600, Math.round(deltaMs)))
+  /**
+   * Instant lip-sync nudge. Positive = audio later; negative = audio earlier.
+   * Manual nudges pause the auto-sync loop for 12 s so a human correction is
+   * never immediately fought by the machine.
+   */
+  nudgeOffsetMs(deltaMs: number, opts?: { auto?: boolean }) {
+    const d = Math.max(-800, Math.min(800, Math.round(deltaMs)))
     if (!d) return
+    if (!opts?.auto) this.autoPausedUntil = Date.now() + 12_000
     this.appliedOffsetMs += d
     this.node?.port.postMessage({ type: 'nudge', deltaMs: d })
     this.fallbackNudge?.(d)
+  }
+
+  /* ------------------------------------------------- auto-sync loop (v3) */
+  /**
+   * Closed-loop lip-sync against the host beacon, 1 Hz:
+   *  - extrapolate the TV playhead NOW on the shared relay clock
+   *  - probe what the listener actually hears NOW (worklet playout position)
+   *  - err = ear − picture: hold at ≤10 ms, inaudible fade-protected
+   *    micro-nudges (40% of err) in the 10–90 ms band, instant re-lock beyond
+   * Guards: track A only, frames < 2.5 s old, beacon < 3.5 s fresh, host
+   * playing, |err| ≤ 2 s (media-loop wrap rejection), manual-nudge pause.
+   */
+  private autoSyncTick() {
+    if (!this.audioStarted || this.destroyed) return
+    const engaged =
+      this.hostState === 'playing' &&
+      this.currentTrack === 0 &&
+      this.beacon != null && Date.now() - this.beacon.relayTs < 3500 &&
+      this.lastArrival != null && performance.now() - this.lastArrival < 2500 &&
+      Date.now() - this.autoPausedUntil > 0
+    if (engaged !== this.autoEngaged) {
+      this.autoEngaged = engaged
+      if (!engaged) this.autoLocked = false
+      this.onStatus({ autoEngaged: engaged, autoLocked: this.autoLocked })
+    }
+    if (!engaged || !this.beacon) return
+
+    const tvNow = this.beacon.mediaTsMs + (Date.now() - this.beacon.relayTs) // media ms on TV now
+    void this.probePlayout().then((probe) => {
+      if (!probe || probe.mediaTsMs == null) return
+      const err = probe.mediaTsMs - tvNow
+      if (!Number.isFinite(err) || Math.abs(err) > 2000) return // loop wrap / junk
+      this.driftMs = Math.round(err)
+
+      const now = Date.now()
+      if (Math.abs(err) <= 10) {
+        if (!this.autoLocked) {
+          this.autoLocked = true
+          this.onStatus({ driftMs: this.driftMs, autoLocked: true })
+        }
+        return
+      }
+      this.autoLocked = false
+      // after a big correction, give the ring time to settle
+      if (now - this.lastRelockAt < 1200) return
+      const delta = Math.abs(err) > 90 ? err : Math.round(err * 0.4) // instant re-lock vs micro-nudge
+      if (!delta) return
+      if (Math.abs(err) > 90) this.lastRelockAt = now
+      this.autoFixedMs += Math.abs(delta)
+      this.nudgeOffsetMs(delta, { auto: true })
+      this.onStatus({ driftMs: this.driftMs, autoLocked: false, autoFixedMs: this.autoFixedMs })
+    })
   }
 
   /** Media-timeline position (ms) of the audio currently reaching the ear. */
@@ -504,6 +586,8 @@ export class SyncClient {
 
   private startTimers() {
     if (this.statsTimer) clearInterval(this.statsTimer)
+    // closed-loop auto lip-sync (v3): 1 Hz against the host beacon
+    if (!this.autoTimer) this.autoTimer = setInterval(() => this.autoSyncTick(), 1000)
     this.statsTimer = setInterval(() => {
       // NTP-style time sync against relay clock
       const c0 = Date.now()
@@ -532,18 +616,22 @@ export class SyncClient {
           this.onStatus({ targetMs: want })
         }
       }
-      // report health to host
+      // report health to host (incl. live lip error — the ≤ 50 ms proof)
       this.socket?.emit('sync:stats', {
         rtt: this.rttEma != null ? Math.round(this.rttEma) : undefined,
         bufferMs: this.bufferNow != null ? Math.round(this.bufferNow) : undefined,
+        drift: this.driftMs != null && this.autoEngaged ? this.driftMs : undefined,
       })
     }, 2000)
   }
+  private autoTimer: ReturnType<typeof setInterval> | null = null
 
   destroy() {
     this.destroyed = true
     if (this.statsTimer) clearInterval(this.statsTimer)
     this.statsTimer = null
+    if (this.autoTimer) clearInterval(this.autoTimer)
+    this.autoTimer = null
     this.socket?.disconnect()
     try { this.ctx?.close() } catch { /* */ }
     this.audioStarted = false

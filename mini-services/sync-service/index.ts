@@ -220,6 +220,24 @@ io.on('connection', (socket: Socket) => {
     }
   })
 
+  /* ------------------------------------------------------ sync beacon (v3) */
+  // The heartbeat of automatic lip-sync: while ON AIR the host beams the TV
+  // playhead once a second. The relay re-stamps it with its own wall-clock so
+  // every listener can extrapolate "what the TV shows NOW" on the shared relay
+  // clock — no cross-device clock assumptions anywhere.
+  socket.on('sync:beacon', (data: { mediaTsMs?: number; state?: 'playing' | 'paused' }) => {
+    const ctx = socketSession.get(socket.id)
+    if (!ctx || ctx.role !== 'host') return
+    const s = sessions.get(ctx.code)
+    if (!s) return
+    s.lastActiveAt = Date.now()
+    socket.to(`sess:${ctx.code}`).emit('sync:beacon', {
+      mediaTsMs: data?.mediaTsMs,
+      state: data?.state || s.state,
+      relayTs: Date.now(),
+    })
+  })
+
   /* -------------------------------------------------------- listener stats */
   socket.on('sync:stats', (data: { rtt?: number; bufferMs?: number; drift?: number }) => {
     const ctx = socketSession.get(socket.id)

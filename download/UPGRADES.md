@@ -1,103 +1,63 @@
-# Sync.audio v2 — Upgrade Notes (buffering · lag · lip-sync)
+# Sync.audio — Upgrade Notes (v2 → v4)
 
-## What you reported vs. what was wrong
+## v4 "Cobalt Noir" (current)
 
-| Your symptom | Root cause in v1 | Fixed in v2 by |
-|---|---|---|
-| "I felt a buffer" (dropouts/underruns) | Fixed 160 ms jitter buffer; every tiny underrun triggered a **full re-prefill** (long silence). 2.6 Mbps Float32 PCM saturated demo Wi-Fi. Host captured audio on the **main thread**, so UI re-renders punched gaps into the capture. | Soft underrun recovery, Int16 wire format (−50% bandwidth), audio-thread capture (see below). |
-| "It was lagging" (high delay) | 43 ms batch + 160 ms jitter + relay hop ≈ **210–260 ms** air latency, plus 100–300 ms of phone DAC/Bluetooth delay that was never compensated. | 21 ms batches, adaptive jitter target (shrinks to ~70–110 ms on stable Wi-Fi), automatic device-delay compensation. |
-| "Mouthing/lip was somewhere down" (lip-sync) | The offset slider only changed the jitter *target*, which converges over **3–10 seconds** via rate correction — nudges felt broken. No output-latency compensation at all. | **Instant** playout nudges (±25/±100 ms buttons), auto-skip of measured device latency, wider ±500 ms range. |
+**Theme.** Full dark redesign in the strict three-color system: black
+`#000000` canvas, white `#FFFFFF` light, cobalt `#2C3480` energy (tints
+`#07081A` surfaces, `#5A66D9/#8A93E8` strokes, `#C7CCF7` light text). Plus
+Jakarta Sans everywhere (400–800), Geist Mono for codes/telemetry. A solid
+white pill means "broadcast live" (ON AIR / LIVE); cobalt means interactive /
+in-sync. Brand: the sync.Audio glitch-wordmark across headers, listener
+screens, favicon and PWA icons.
 
-## The 6 upgrades shipped in v2
+**AWS Builder Challenge plane.** `src/lib/telemetry.ts` (batched bus, 3 s
+flush, pagehide sendBeacon) → `POST /api/telemetry` (validation + 600-event
+ring) → `AWS_TELEMETRY_URL` Lambda Function URL → DynamoDB (TTL 30 d). Events:
+`session_open`, `broadcast_state`, `listeners_changed`, `drift_report`
+(12 s host pulse + 10 s listener pulse), `session_join`, `audio_start`,
+rebuffer edges. IaC: `aws/` (SAM, nodejs20.x, Function URL CORS, BatchWrite).
+Local mode without the env var — audio never waits on AWS.
 
-1. **Protocol v2 — Int16 PCM wire format** (`src/lib/sync-protocol.ts`)
-   Payload halved Float32→Int16 with a codec byte for future Opus.
-   Uplink: **2.6 Mbps → 1.54 Mbps** dual-track (verified live: 1560 kbps).
-   Less Wi-Fi airtime = fewer queuing spikes = fewer underruns with many phones.
+**Open Source.** MIT `LICENSE` at repo root + `"license": "MIT"` in
+package.json; `FRICTION-LOG.md` (17 frictions, workarounds, platform asks +
+Devpost-ready feedback appendix); root README with two-process quickstart;
+`docs/SUBMISSION-CHECKLIST.md` (video storyboard, judge collaborators
+knmeiss/giolaq/anishamalade/mosesroth/emersonsklar, Devpost fields).
 
-2. **Soft underrun recovery** (`public/worklets/player-worklet.js`)
-   Short starvations (<350 ms) ride through with silence and resume as soon as
-   ~30 ms of audio lands, with a 256-sample fade-in (no clicks, no re-prefill).
-   Only long starvation falls back to a full prefill gate.
-   Result: a Wi-Fi hiccup costs ~50 ms of quiet instead of a multi-second stall.
+## v3 "Auto-Sync"
 
-3. **Audio-thread capture on the host** (`public/worklets/capture-worklet.js` + `src/lib/sync-host.ts`)
-   Capture moved from ScriptProcessor (main thread) to an AudioWorklet on the
-   dedicated audio thread — UI re-renders no longer punch gaps into the
-   broadcast. ScriptProcessor fallback kept for old WebViews.
+**Closed-loop lip-sync (headline).** The host beams a 1 Hz `sync:beacon`
+(TV playhead + relay wall-clock re-stamp). Each listener extrapolates the TV
+playhead on the shared clock, probes what actually reaches the ear (worklet
+playout position), and self-corrects: hold ≤ 10 ms, fade-protected
+micro-nudges at 10–90 ms, instant re-lock beyond. Guards: track A only,
+frames < 2.5 s fresh, beacon < 3.5 s fresh, |err| ≤ 2 s loop-wrap rejection,
+manual nudges pause the loop 12 s. Result: **drift ≤ 50 ms without any manual
+tuning** — surfaced as live "lip error" on the phone and per-listener drift
+chips + a Worst-drift card on the host console.
 
-4. **Smaller batches** — 2048 → 1024 samples (**43 ms → 21 ms**), cutting
-   22 ms off the pipe immediately.
+**Latency/buffer hardening.** Initial jitter target 140→110 ms; transport
+compression off; `startTimers` also fires on the `connect` path (previously
+the stats/jitter loop could stay dormant); nudge clamp widened ±800 ms.
 
-5. **Adaptive jitter buffer** (`src/lib/sync-client.ts`)
-   The listener measures frame inter-arrival jitter continuously and sizes the
-   buffer to the network: `target = 2.8 × jitter + batch period + 50 ms`,
-   clamped 70–300 ms. Starts at 140 ms, shrinks only after 8 s of stable
-   playout, grows instantly when the network degrades. Stable Wi-Fi settles
-   near **~70–110 ms** instead of a permanent 160 ms.
+**One-click demo.** The host's primary button is now "▶ Play demo — go live":
+one tap = demo cue + ON AIR + beacon.
 
-6. **Lip-sync: instant nudges + auto device-delay compensation** (`sync-client.ts`, `Listener.tsx`)
-   - `nudge` worklet message shifts the playout point **instantly** (skip or
-     replay with a fade) — nudge buttons respond in real time, range ±500 ms.
-   - On start, the client reads `AudioContext.baseLatency + outputLatency`
-     (DAC/Bluetooth pipeline delay) and skips exactly that much audio right
-     after prefill, auto-removing 100–300 ms of device delay. A one-time
-     top-up runs at 1.2 s when Chrome settles the real outputLatency.
-   - Listener UI shows the compensated amount and per-device jitter telemetry.
+## v2 (baseline for this file)
 
-## Latency math — before vs after
+- Wire protocol v2: Int16 PCM (uplink halved to ≈ 1.56 Mbps/track), codec
+  byte for future Opus.
+- Capture moved to an AudioWorklet on the audio thread (1024-sample
+  transferable batches ≈ 21 ms); ScriptProcessor fallback retained.
+- Adaptive jitter target 70–300 ms (grows instantly, shrinks after 8 s
+  stable), soft underrun recovery, device output-latency auto-skip with 1.2 s
+  top-up, instant nudges, NTP-style 5-probe timesync + EMA.
+- Air latency ≈ 210–260 ms → ≈ 90–160 ms (further → 80–140 ms in v3/v4).
 
-```
-v1:  43 ms batch + 160 ms jitter + RTT/2 + 0 ms device-comp
-     ≈ 210–260 ms air + 100–300 ms device ≈ 350–500 ms behind the TV picture
+## Verification log
 
-v2:  21 ms batch + 70–140 ms adaptive jitter + RTT/2 − skip(base+output latency)
-     ≈ 90–160 ms air + device delay auto-removed
-     residual lip-sync fixed with two taps of ±25 ms (instant)
-```
-
-## File map (what to open for judges)
-
-| File | Role |
-|---|---|
-| `src/lib/sync-protocol.ts` | 24-byte binary frame header, Int16 codec, v2 |
-| `public/worklets/capture-worklet.js` | host audio-thread capture, 1024-sample batches |
-| `public/worklets/player-worklet.js` | adaptive jitter buffer, soft underrun, nudge, skip |
-| `src/lib/sync-host.ts` | host engine: capture graph, fan-out uplink, stats |
-| `src/lib/sync-client.ts` | listener engine: jitter sizing, clock sync, nudges |
-| `src/lib/relay-socket.ts` | gateway/direct relay connection strategy |
-| `mini-services/sync-service/index.ts` | socket.io relay: rooms, opaque binary fan-out |
-| `src/components/sync/HostConsole.tsx` | "Fire TV" console: QR, transport, telemetry |
-| `src/components/sync/Listener.tsx` | zero-install PWA player: nudges, stats |
-| `src/components/sync/Landing.tsx` | pitch page |
-| `src/app/page.tsx` | query-param SPA router (`?p=host`, `?p=join&s=CODE`) |
-| `scripts/gen_demo_audio.py` | demo WAV generator (action cue + commentary) |
-| `public/demo/*.wav` | 64 s demo assets |
-
-## Run it (demo mode on a laptop)
-
-```bash
-# 1. relay
-cd mini-services/sync-service && bun install && bun run dev   # :3003
-
-# 2. app
-bun install && bun run dev                                    # :3000
-
-# 3. host console:  http://localhost:3000/?p=host
-#    phones scan the QR → http://<lan-ip>:3000/?p=join&s=CODE
-#    (phones must be on the same Wi-Fi as the laptop)
-```
-
-## What to upgrade next (roadmap, in impact order)
-
-1. **Opus via WebCodecs** (`AudioEncoder`/`AudioDecoder`, 20 ms frames):
-   1.54 Mbps → ~128 kbps per track. Biggest remaining win for congested
-   venue Wi-Fi; the v2 codec byte already reserves room for it.
-2. **Timestamp-based shared playout timeline**: schedule each frame at
-   `captureTs + sharedDelay` on every device's synced clock instead of
-   pure jitter-target alignment — tightens cross-listener spread below ±10 ms
-   even on mixed wired/Bluetooth setups.
-3. **Lip-sync wizard**: host flashes a white frame + beep; listener taps on
-   hearing the beep in the earbuds and the offset is set automatically.
-4. **Sample-rate ladder**: offer a 24 kHz "crowd mode" (halves bandwidth
-   again) for hostile networks.
+- `bunx tsc --noEmit` clean · `bun run build` clean (`/api/telemetry` registered)
+- Live e2e (headless): host ON AIR + AUTO-SYNC ON + relay link up; listener
+  connects, LIVE state, Auto-sync card + lip-error readout present
+- Headless renderer still dies during long live playout (sandbox has no audio
+  device) — real-phone dress rehearsal remains on the pre-judging checklist

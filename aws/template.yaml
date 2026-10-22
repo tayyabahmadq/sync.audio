@@ -1,0 +1,60 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Sync.audio telemetry plane — system events, sync drift reports and host audio metadata into DynamoDB (AWS Builder Challenge)
+
+Parameters:
+  TtlDays:
+    Type: Number
+    Default: 30
+    Description: DynamoDB item time-to-live in days
+
+Resources:
+  TelemetryTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub sync-audio-telemetry-${AWS::StackName}
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: N
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+        - AttributeName: sk
+          KeyType: RANGE
+      BillingMode: PAY_PER_REQUEST
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+
+  IngestFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub sync-audio-telemetry-${AWS::StackName}
+      Runtime: nodejs20.x
+      Handler: index.handler
+      Timeout: 10
+      MemorySize: 256
+      CodeUri: .
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TelemetryTable
+      Events:
+        Ingest:
+          Type: FunctionUrl
+          Properties:
+            AuthType: NONE
+            Cors:
+              AllowOrigins: ['*']
+              AllowMethods: ['POST', 'OPTIONS', 'GET']
+              AllowHeaders: ['content-type']
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref TelemetryTable
+          TTL_DAYS: !Ref TtlDays
+
+Outputs:
+  IngestUrl:
+    Description: Function URL — put this in .env.local as AWS_TELEMETRY_URL=<url>
+    Value: !GetAtt IngestFunction.FunctionUrl

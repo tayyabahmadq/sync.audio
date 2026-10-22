@@ -303,6 +303,7 @@ export class SyncHost {
     this.broadcasting = true
     this.startedAt = Date.now()
     this.socket?.emit('sync:state', { state: 'playing' })
+    this.startBeacon()
     this.requestWakeLock()
   }
 
@@ -310,6 +311,7 @@ export class SyncHost {
     this.tracks.forEach((t) => t.element.pause())
     this.broadcasting = false
     this.socket?.emit('sync:state', { state: 'paused' })
+    this.stopBeacon()
   }
 
   stop() {
@@ -319,6 +321,31 @@ export class SyncHost {
     })
     this.broadcasting = false
     this.socket?.emit('sync:state', { state: 'idle' })
+    this.stopBeacon()
+  }
+
+  /* ---------------------------------------------------- sync beacon (v3) */
+  // The closed-loop heartbeat: once a second, beam the visible track's
+  // playhead (media timeline) to the room. The relay re-stamps it with the
+  // shared wall-clock; each listener extrapolates "what the TV shows now",
+  // compares with "what reaches my ear now", and self-corrects — drift
+  // ≤ 50 ms without any manual tuning.
+  private beaconTimer: ReturnType<typeof setInterval> | null = null
+  private startBeacon() {
+    this.stopBeacon()
+    const fire = () => {
+      if (!this.broadcasting || !this.socket) return
+      const mediaTsMs = this.getVisibleMediaTime()
+      this.socket.emit('sync:beacon', {
+        mediaTsMs: mediaTsMs ?? undefined,
+        state: 'playing' as const,
+      })
+    }
+    fire()
+    this.beaconTimer = setInterval(fire, 1000)
+  }
+  private stopBeacon() {
+    if (this.beaconTimer) { clearInterval(this.beaconTimer); this.beaconTimer = null }
   }
 
   private wakeLock: { release: () => Promise<void> } | null = null
@@ -331,6 +358,7 @@ export class SyncHost {
 
   destroy() {
     this.stop()
+    this.stopBeacon()
     try { this.wakeLock?.release() } catch { /* */ }
     this.socket?.disconnect()
     this.tracks.forEach((t) => { try { t.capture.disconnect() } catch { /* */ }; t.source.disconnect() })

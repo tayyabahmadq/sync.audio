@@ -60,7 +60,7 @@ class SyncPlayer extends AudioWorkletProcessor {
     } else if (msg.type === 'target') {
       this.targetMs = Math.max(40, Math.min(1000, msg.targetMs))
     } else if (msg.type === 'nudge') {
-      const d = Math.max(-500, Math.min(500, msg.deltaMs || 0))
+      const d = Math.max(-800, Math.min(800, msg.deltaMs || 0))
       if (d !== 0) this.applyNudge(Math.round((d / 1000) * this.streamRate))
     } else if (msg.type === 'probe') {
       // media-timeline position of the sample currently reaching the ear + fill

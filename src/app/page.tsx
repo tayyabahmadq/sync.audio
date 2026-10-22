@@ -27,9 +27,9 @@ function getServerSnapshot(): string {
 
 function Splash() {
   return (
-    <div className="flex min-h-screen flex-col items-center justify-center gap-4 bg-[#08090c]">
+    <div className="flex min-h-screen flex-col items-center justify-center gap-4 bg-black">
       <WaveGlyph className="h-12 w-12 animate-pulse" />
-      <div className="font-mono text-xs tracking-[0.3em] text-zinc-600">SYNC.AUDIO</div>
+      <div className="font-mono text-xs tracking-[0.3em] text-[#8A93E8]">SYNC.AUDIO</div>
     </div>
   )
 }

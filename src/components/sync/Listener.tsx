@@ -1,15 +1,18 @@
 'use client'
 
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { WaveGlyph, Pill } from './bits'
+import { Logo, Pill } from './bits'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { SyncClient, type ClientStatus } from '@/lib/sync-client'
+import { trackEvent } from '@/lib/telemetry'
 
 const iOS = () =>
   typeof navigator !== 'undefined' &&
   (/iPad|iPhone|iPod/.test(navigator.userAgent) ||
     (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1))
+
+const DRIFT_SPEC_MS = 50
 
 export default function Listener({ sessionParam }: { sessionParam: string }) {
   const [stage, setStage] = useState<'code' | 'ready' | 'live'>('code')
@@ -25,6 +28,7 @@ export default function Listener({ sessionParam }: { sessionParam: string }) {
     connected: false, joined: false, streaming: false, hostState: 'idle',
     sampleRate: 48000, tracks: [], rtt: null, offsetMs: null, bufferMs: null,
     jitterMs: null, targetMs: null, skipMs: null, starving: true, frames: 0, drops: 0,
+    driftMs: null, autoEngaged: false, autoLocked: false, autoFixedMs: 0,
   })
 
   const clientRef = useRef<SyncClient | null>(null)
@@ -61,6 +65,7 @@ export default function Listener({ sessionParam }: { sessionParam: string }) {
       setTimeout(() => setFlashPulse(false), 240)
     }
     c.connect(code, listenerName)
+    trackEvent('session_join', { session: code, name: listenerName })
     setStage('ready')
   }, [])
 
@@ -77,6 +82,31 @@ export default function Listener({ sessionParam }: { sessionParam: string }) {
     }
   }, [])
 
+  /* ------------------------------------------- AWS telemetry: rebuffer edges */
+  const starveRef = useRef(true)
+  useEffect(() => {
+    if (stage !== 'live') { starveRef.current = true; return }
+    if (status.starving !== starveRef.current) {
+      starveRef.current = status.starving
+      trackEvent(status.starving ? 'rebuffer_start' : 'rebuffer_end', {
+        session, bufferMs: status.bufferMs,
+      })
+    }
+  }, [status.starving, status.bufferMs, stage, session])
+
+  /* --------------------------------------------- AWS telemetry: drift pulse */
+  useEffect(() => {
+    if (stage !== 'live') return
+    const t = setInterval(() => {
+      if (!status.autoEngaged || status.driftMs == null) return
+      trackEvent('drift_report', {
+        session, driftMs: status.driftMs, specMs: DRIFT_SPEC_MS,
+        autoLocked: status.autoLocked, autoFixedMs: status.autoFixedMs,
+      })
+    }, 10_000)
+    return () => clearInterval(t)
+  }, [stage, status.autoEngaged, status.driftMs, status.autoLocked, status.autoFixedMs, session])
+
   /* ------------------------------------------------------ start audio */
   const startListening = async () => {
     const c = clientRef.current
@@ -87,6 +117,7 @@ export default function Listener({ sessionParam }: { sessionParam: string }) {
       c.setVolume(volume)
       setOffset(c.appliedOffsetMs) // reflect any restored calibration
       setStage('live')
+      trackEvent('audio_start', { session })
     } else {
       setError('Could not start audio engine on this device.')
     }
@@ -116,7 +147,7 @@ export default function Listener({ sessionParam }: { sessionParam: string }) {
     const errs = errsRef.current
     if (!c || errs.length === 0) return
     const sorted = [...errs].sort((a, b) => a - b)
-    const med = Math.max(-600, Math.min(600, Math.round(sorted[Math.floor(sorted.length / 2)])))
+    const med = Math.max(-800, Math.min(800, Math.round(sorted[Math.floor(sorted.length / 2)])))
     c.nudgeOffsetMs(med)
     SyncClient.saveOffset(session, c.appliedOffsetMs)
     setOffset(c.appliedOffsetMs)
@@ -130,7 +161,7 @@ export default function Listener({ sessionParam }: { sessionParam: string }) {
     if (!c) return
     const probe = await c.probePlayout()
     if (!probe || probe.mediaTsMs == null) {
-      setWizardMsg('This browser cannot probe playout — use the manual nudges below instead.')
+      setWizardMsg('This browser cannot probe playout — use the manual nudges instead.')
       return
     }
     const f = [...flashLogRef.current].reverse().find((e) => e.mediaTsMs >= 0)
@@ -183,8 +214,8 @@ export default function Listener({ sessionParam }: { sessionParam: string }) {
         const y0 = cy + Math.sin(ang) * base
         const x1 = cx + Math.cos(ang) * (base + len)
         const y1 = cy + Math.sin(ang) * (base + len)
-        const hue = 150 + (i / bars) * 130 // emerald → fuchsia sweep
-        g.strokeStyle = `hsla(${hue}, 80%, ${45 + v * 25}%, ${0.35 + v * 0.65})`
+        // cobalt sweep — the single brand hue, lit for the black stage
+        g.strokeStyle = `hsla(${238 + (i / bars) * 14}, 62%, ${44 + v * 22}%, ${0.35 + v * 0.65})`
         g.lineWidth = Math.max(2, (w / bars) * 0.28)
         g.lineCap = 'round'
         g.beginPath()
@@ -195,7 +226,7 @@ export default function Listener({ sessionParam }: { sessionParam: string }) {
       // core dot
       g.beginPath()
       g.arc(cx, cy, base * 0.32 * breath, 0, Math.PI * 2)
-      g.fillStyle = 'rgba(52, 211, 153, 0.9)'
+      g.fillStyle = 'rgba(138, 147, 232, 0.92)'
       g.fill()
     }
     raf = requestAnimationFrame(draw)
@@ -219,36 +250,52 @@ export default function Listener({ sessionParam }: { sessionParam: string }) {
   const changeVolume = (v: number) => { setVolume(v); clientRef.current?.setVolume(v) }
   // instant lip-sync nudge: positive delays audio, negative advances it
   const nudge = (d: number) => {
-    const next = Math.max(-500, Math.min(500, offset + d))
+    const next = Math.max(-800, Math.min(800, offset + d))
     setOffset(next)
     clientRef.current?.nudgeOffsetMs(next - offset)
   }
 
   const live = status.hostState === 'playing'
   const paused = status.hostState === 'paused'
+  const lipErr = status.driftMs
+  const lipErrTxt = lipErr == null
+    ? null
+    : lipErr >= 0
+      ? `${lipErr} ms ahead of picture`
+      : `${-lipErr} ms behind picture`
+  const autoSub = status.autoEngaged
+    ? status.streaming
+      ? `beacon-locked · correcting ${status.autoFixedMs > 0 ? `${status.autoFixedMs} ms so far` : 'live'}`
+      : 'rebuffering — will re-lock automatically'
+    : live
+      ? activeTrack !== 0
+        ? 'rides track A — switch to track A to auto-align'
+        : 'waiting for the host beacon…'
+      : 'standby — activates when the host plays'
 
   /* ------------------------------------------------------------ views */
   if (stage === 'code') {
     return (
       <Shell>
-        <div className="w-full max-w-sm rounded-3xl border border-zinc-800 bg-zinc-900/50 p-7 text-center">
-          <WaveGlyph className="mx-auto h-14 w-14" />
-          <h1 className="mt-4 text-xl font-bold text-zinc-100">Join a silent session</h1>
-          <p className="mt-1 text-sm text-zinc-500">Enter the code shown next to the QR on the TV.</p>
+        <div className="w-full max-w-sm rounded-3xl border border-[#23265a] bg-[#07081a] p-7 text-center shadow-[0_1px_2px_rgba(0,0,0,0.8),0_24px_60px_-32px_rgba(44,52,128,0.8)]">
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img src="/logo.png" alt="Sync.audio" draggable={false} className="mx-auto h-10 w-auto" />
+          <h1 className="mt-4 text-xl font-extrabold text-white">Join a silent session</h1>
+          <p className="mt-1 text-sm text-white/55">Enter the code shown next to the QR on the TV.</p>
           <Input
             value={codeInput}
             onChange={(e) => setCodeInput(e.target.value.toUpperCase())}
             onKeyDown={(e) => e.key === 'Enter' && joinWithCode()}
             placeholder="CODE"
             maxLength={6}
-            className="mt-5 border-zinc-700 bg-zinc-950 text-center font-mono text-2xl tracking-[0.4em] placeholder:text-zinc-700"
+            className="mt-5 border-white/15 bg-white/[0.05] text-center font-mono text-2xl tracking-[0.4em] text-white placeholder:text-white/25"
             aria-label="Session code"
           />
-          {error && <p className="mt-3 text-xs text-rose-400">{error}</p>}
-          <Button onClick={joinWithCode} className="mt-4 w-full bg-emerald-500 font-semibold text-zinc-950 hover:bg-emerald-400">
+          {error && <p className="mt-3 text-xs font-semibold text-red-400">{error}</p>}
+          <Button onClick={joinWithCode} className="mt-4 w-full bg-[#2C3480] font-semibold text-white hover:bg-[#232B72]">
             Connect
           </Button>
-          <a href="/" className="mt-4 block text-xs text-zinc-600 hover:text-zinc-400">← What is Sync.audio?</a>
+          <a href="/" className="mt-4 block text-xs text-white/45 transition-colors hover:text-white">← What is Sync.audio?</a>
         </div>
       </Shell>
     )
@@ -257,35 +304,39 @@ export default function Listener({ sessionParam }: { sessionParam: string }) {
   if (stage === 'ready') {
     return (
       <Shell>
-        <div className="w-full max-w-sm rounded-3xl border border-zinc-800 bg-zinc-900/50 p-7 text-center">
-          <Pill tone={status.joined ? 'emerald' : 'amber'} className="mb-4">
-            {status.joined ? `connected · session ${session}` : 'connecting…'}
-          </Pill>
-          <WaveGlyph className="mx-auto h-16 w-16" />
-          <h1 className="mt-4 text-xl font-bold text-zinc-100">You&apos;re in. Tap to hear.</h1>
-          <p className="mt-1 text-sm text-zinc-500">
+        <div className="w-full max-w-sm rounded-3xl border border-[#23265a] bg-[#07081a] p-7 text-center shadow-[0_1px_2px_rgba(0,0,0,0.8),0_24px_60px_-32px_rgba(44,52,128,0.8)]">
+          <div className="mb-4 flex justify-center">
+            <Pill tone={status.joined ? 'cyan' : 'amber'}>
+              {status.joined ? `connected · session ${session}` : 'connecting…'}
+            </Pill>
+          </div>
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img src="/logo.png" alt="Sync.audio" draggable={false} className="mx-auto h-10 w-auto" />
+          <h1 className="mt-4 text-xl font-extrabold text-white">You&apos;re in. Tap to hear.</h1>
+          <p className="mt-1 text-sm text-white/55">
             Browsers need one tap before playing audio. Put your earbuds on, then tap below.
+            Sync to the picture is automatic from here.
           </p>
           <input
             value={name}
             onChange={(e) => setName(e.target.value)}
             placeholder="Your name (optional)"
-            className="mt-4 w-full rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 text-center text-sm text-zinc-200 placeholder:text-zinc-600"
+            className="mt-4 w-full rounded-lg border border-white/15 bg-white/[0.05] px-3 py-2 text-center text-sm text-white placeholder:text-white/35"
             aria-label="Display name"
           />
           <Button
             onClick={startListening}
-            className="mt-4 h-14 w-full animate-pulse bg-emerald-500 text-lg font-bold text-zinc-950 hover:animate-none hover:bg-emerald-400"
+            className="mt-4 h-14 w-full animate-pulse bg-[#2C3480] text-lg font-bold text-white shadow-[0_14px_36px_-12px_rgba(44,52,128,1)] hover:animate-none hover:bg-[#232B72]"
           >
             🎧 Start listening
           </Button>
           {isIos && (
-            <p className="mt-4 rounded-xl border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-[11px] leading-relaxed text-amber-300">
+            <p className="mt-4 rounded-xl border border-[#5A66D9]/40 bg-[#2C3480]/20 px-3 py-2 text-[11px] font-medium leading-relaxed text-[#C7CCF7]">
               iPhone? Flip the ring/silent switch OFF — iOS mutes web audio while the switch is on.
             </p>
           )}
-          {error && <p className="mt-3 text-xs text-rose-400">{error}</p>}
-          <a href="/" className="mt-4 block text-xs text-zinc-600 hover:text-zinc-400">← What is Sync.audio?</a>
+          {error && <p className="mt-3 text-xs font-semibold text-red-400">{error}</p>}
+          <a href="/" className="mt-4 block text-xs text-white/45 transition-colors hover:text-white">← What is Sync.audio?</a>
         </div>
       </Shell>
     )
@@ -297,33 +348,65 @@ export default function Listener({ sessionParam }: { sessionParam: string }) {
       <div className="w-full max-w-md">
         {/* status header */}
         <div className="mb-4 flex items-center justify-between">
-          <div className="flex items-center gap-2">
-            <WaveGlyph className="h-8 w-8" />
-            <div>
-              <div className="text-sm font-bold text-zinc-100">Sync<span className="text-emerald-400">.audio</span></div>
-              <div className="font-mono text-[10px] text-zinc-500">session {session}</div>
-            </div>
+          <div>
+            {/* eslint-disable-next-line @next/next/no-img-element */}
+            <img src="/logo.png" alt="Sync.audio" draggable={false} className="h-7 w-auto" />
+            <div className="mt-0.5 font-mono text-[10px] text-white/50">session {session}</div>
           </div>
           <Pill tone={live ? 'rose' : paused ? 'amber' : 'zinc'}>
-            {live && <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-rose-400" />}
+            {live && <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-[#2C3480]" />}
             {live ? 'LIVE' : paused ? 'HOST PAUSED' : 'STANDBY'}
           </Pill>
         </div>
 
         {/* visualizer */}
-        <div className="relative overflow-hidden rounded-3xl border border-zinc-800 bg-gradient-to-b from-zinc-900/70 to-black">
+        <div className="relative overflow-hidden rounded-3xl border border-[#23265a] bg-gradient-to-b from-[#0d0f26] to-black shadow-[inset_0_1px_0_rgba(138,147,232,0.08)]">
           <canvas ref={canvasRef} className="h-64 w-full" aria-hidden />
           <div className="pointer-events-none absolute inset-x-0 bottom-3 text-center">
-            <div className="font-mono text-[10px] uppercase tracking-[0.25em] text-zinc-500">
+            <div className="font-mono text-[10px] uppercase tracking-[0.25em] text-white/45">
               {status.streaming ? 'receiving · in sync' : live ? 'rebuffering — holding sync…' : paused ? 'host paused' : 'waiting for host to start'}
             </div>
+            {lipErrTxt && status.autoEngaged && (
+              <div className="mt-0.5 font-mono text-[10px] text-[#8A93E8]">
+                lip error {lipErrTxt} · spec ≤ {DRIFT_SPEC_MS} ms
+              </div>
+            )}
           </div>
+        </div>
+
+        {/* auto-sync status */}
+        <div className={`mt-4 rounded-2xl border p-4 transition-colors ${
+          status.autoEngaged
+            ? 'border-[#5A66D9]/50 bg-[#2C3480]/20 shadow-[0_10px_30px_-18px_rgba(44,52,128,1)]'
+            : 'border-[#23265a] bg-[#07081a]'
+        }`}>
+          <div className="flex items-center justify-between">
+            <div className="text-sm font-bold text-white">Auto-sync</div>
+            <Pill tone={status.autoEngaged ? (status.autoLocked ? 'amber' : 'cyan') : 'zinc'}>
+              {status.autoEngaged ? (status.autoLocked ? '🔒 locked' : 'engaged') : 'standby'}
+            </Pill>
+          </div>
+          <div className="mt-1.5 font-mono text-sm text-[#C7CCF7]">
+            {lipErrTxt ?? 'measuring lip error…'}
+          </div>
+          <div className="text-[11px] text-white/45">{autoSub}</div>
+        </div>
+
+        {/* volume */}
+        <div className="mt-4 flex items-center gap-3 rounded-2xl border border-[#23265a] bg-[#07081a] p-4">
+          <span className="w-8 text-center text-sm" aria-hidden>🔊</span>
+          <input
+            type="range" min={0} max={1} step={0.01} value={volume}
+            onChange={(e) => changeVolume(Number(e.target.value))}
+            className="h-1.5 flex-1 accent-[#2C3480]"
+            aria-label="Volume"
+          />
         </div>
 
         {/* track picker */}
         {status.tracks.length > 0 && (
           <div className="mt-4">
-            <div className="mb-2 text-[10px] uppercase tracking-[0.15em] text-zinc-500">Audio track</div>
+            <div className="mb-2 text-[10px] font-semibold uppercase tracking-[0.15em] text-white/40">Audio track</div>
             <div className="grid grid-cols-2 gap-2">
               {status.tracks.map((t) => {
                 const active = Number(t.id) === activeTrack
@@ -333,12 +416,12 @@ export default function Listener({ sessionParam }: { sessionParam: string }) {
                     onClick={() => switchTrack(Number(t.id))}
                     className={`rounded-xl border px-3 py-3 text-left text-xs transition-colors ${
                       active
-                        ? 'border-emerald-400/60 bg-emerald-500/10 text-emerald-200'
-                        : 'border-zinc-800 bg-zinc-900/50 text-zinc-400 hover:border-zinc-600'
+                        ? 'border-[#5A66D9]/60 bg-[#2C3480]/25 text-[#C7CCF7]'
+                        : 'border-[#23265a] bg-[#07081a] text-white/55 hover:border-[#5A66D9]/40'
                     }`}
                   >
-                    <span className="block font-mono text-[10px] text-zinc-500">TRACK {Number(t.id) === 0 ? 'A' : 'B'}</span>
-                    <span className="mt-0.5 block truncate font-medium">{t.name || `Track ${t.id}`}</span>
+                    <span className="block font-mono text-[10px] text-white/40">TRACK {Number(t.id) === 0 ? 'A' : 'B'}</span>
+                    <span className="mt-0.5 block truncate font-semibold text-white">{t.name || `Track ${t.id}`}</span>
                   </button>
                 )
               })}
@@ -346,51 +429,41 @@ export default function Listener({ sessionParam }: { sessionParam: string }) {
           </div>
         )}
 
-        {/* auto lip-sync wizard */}
-        <button
-          onClick={startWizard}
-          className={`mt-4 w-full rounded-2xl border px-4 py-3 text-left text-sm font-semibold transition-colors ${
-            offset === 0
-              ? 'animate-pulse border-emerald-400/70 bg-emerald-500/15 text-emerald-200'
-              : 'border-zinc-700 bg-zinc-900/60 text-zinc-300 hover:border-emerald-500/50'
-          }`}
-        >
-          ⚡ Sync to screen
-          <span className="ml-2 text-xs font-normal text-zinc-500">tap when the TV flashes — corrected automatically</span>
-        </button>
-
-        {/* volume + nudge */}
-        <div className="mt-4 space-y-3 rounded-2xl border border-zinc-800 bg-zinc-900/40 p-4">
-          <div className="flex items-center gap-3">
-            <span className="w-8 text-center text-sm" aria-hidden>🔊</span>
-            <input
-              type="range" min={0} max={1} step={0.01} value={volume}
-              onChange={(e) => changeVolume(Number(e.target.value))}
-              className="h-1.5 flex-1 accent-emerald-400"
-              aria-label="Volume"
-            />
-          </div>
-          <div className="flex items-center justify-between gap-2">
-            <span className="text-[10px] uppercase tracking-[0.15em] text-zinc-500">Lip-sync nudge</span>
-            <div className="flex items-center gap-1.5">
-              <Button variant="outline" size="sm" onClick={() => nudge(-100)} className="h-7 border-zinc-700 px-2 font-mono text-[10px]">−100</Button>
-              <Button variant="outline" size="sm" onClick={() => nudge(-25)} className="h-7 border-zinc-700 px-2 font-mono text-[10px]">−25</Button>
-              <span className={`w-16 text-center font-mono text-xs ${offset === 0 ? 'text-zinc-400' : 'text-emerald-300'}`}>
-                {offset > 0 ? '+' : ''}{offset} ms
-              </span>
-              <Button variant="outline" size="sm" onClick={() => nudge(25)} className="h-7 border-zinc-700 px-2 font-mono text-[10px]">+25</Button>
-              <Button variant="outline" size="sm" onClick={() => nudge(100)} className="h-7 border-zinc-700 px-2 font-mono text-[10px]">+100</Button>
-              {offset !== 0 && (
-                <button onClick={() => nudge(-offset)} className="ml-0.5 text-[10px] text-zinc-500 underline hover:text-zinc-300">reset</button>
-              )}
+        {/* advanced · manual lip-sync */}
+        <details className="mt-4 rounded-2xl border border-[#23265a] bg-[#07081a] px-4 py-3">
+          <summary className="cursor-pointer select-none text-xs font-semibold uppercase tracking-[0.12em] text-white/45">
+            Advanced · manual lip-sync
+          </summary>
+          <div className="mt-3 space-y-3">
+            <button
+              onClick={startWizard}
+              className="w-full rounded-xl border border-[#5A66D9]/45 bg-[#2C3480]/20 px-4 py-2.5 text-left text-sm font-semibold text-[#C7CCF7] transition-colors hover:border-[#8A93E8]"
+            >
+              ⚡ Sync to screen
+              <span className="ml-2 text-xs font-normal text-white/45">tap when the TV flashes</span>
+            </button>
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-[10px] uppercase tracking-[0.15em] text-white/40">Nudge</span>
+              <div className="flex items-center gap-1.5">
+                <Button variant="outline" size="sm" onClick={() => nudge(-100)} className="h-7 border-white/15 bg-transparent px-2 font-mono text-[10px] text-white/80 hover:bg-white/10">−100</Button>
+                <Button variant="outline" size="sm" onClick={() => nudge(-25)} className="h-7 border-white/15 bg-transparent px-2 font-mono text-[10px] text-white/80 hover:bg-white/10">−25</Button>
+                <span className={`w-16 text-center font-mono text-xs ${offset === 0 ? 'text-white/45' : 'text-[#8A93E8]'}`}>
+                  {offset > 0 ? '+' : ''}{offset} ms
+                </span>
+                <Button variant="outline" size="sm" onClick={() => nudge(25)} className="h-7 border-white/15 bg-transparent px-2 font-mono text-[10px] text-white/80 hover:bg-white/10">+25</Button>
+                <Button variant="outline" size="sm" onClick={() => nudge(100)} className="h-7 border-white/15 bg-transparent px-2 font-mono text-[10px] text-white/80 hover:bg-white/10">+100</Button>
+                {offset !== 0 && (
+                  <button onClick={() => nudge(-offset)} className="ml-0.5 text-[10px] text-white/40 underline hover:text-white/80">reset</button>
+                )}
+              </div>
             </div>
+            {status.skipMs != null && status.skipMs > 0 && (
+              <div className="text-[10px] leading-relaxed text-white/45">
+                Device delay auto-compensated: <span className="font-mono text-[#8A93E8]">{status.skipMs} ms</span> (DAC/Bluetooth). Manual nudges pause auto-sync for 12 s.
+              </div>
+            )}
           </div>
-          {status.skipMs != null && status.skipMs > 0 && (
-            <div className="text-[10px] leading-relaxed text-zinc-500">
-              Device delay auto-compensated: <span className="font-mono text-emerald-400">{status.skipMs} ms</span> (DAC/Bluetooth). Use the nudges if voices still trail the picture.
-            </div>
-          )}
-        </div>
+        </details>
 
         {/* telemetry */}
         <div className="mt-4 grid grid-cols-4 gap-2 text-center">
@@ -400,19 +473,19 @@ export default function Listener({ sessionParam }: { sessionParam: string }) {
             { l: 'rtt', v: status.rtt != null ? `${status.rtt}` : '—', u: 'ms' },
             { l: 'jitter tgt', v: status.targetMs != null ? `${status.targetMs}` : '—', u: 'ms' },
           ].map((s) => (
-            <div key={s.l} className="rounded-xl border border-zinc-800 bg-zinc-900/40 py-2">
-              <div className="font-mono text-sm font-semibold text-zinc-100">{s.v}<span className="text-[9px] text-zinc-500">{s.u}</span></div>
-              <div className="text-[9px] uppercase tracking-wider text-zinc-600">{s.l}</div>
+            <div key={s.l} className="rounded-xl border border-[#23265a] bg-[#07081a] py-2">
+              <div className="font-mono text-sm font-semibold text-white">{s.v}<span className="text-[9px] text-white/35">{s.u}</span></div>
+              <div className="text-[9px] uppercase tracking-wider text-white/35">{s.l}</div>
             </div>
           ))}
         </div>
 
         {status.drops > 0 && (
-          <div className="mt-2 text-center font-mono text-[10px] text-amber-500/80">{status.drops} frames recovered from jitter</div>
+          <div className="mt-2 text-center font-mono text-[10px] text-[#8A93E8]/80">{status.drops} frames recovered from jitter</div>
         )}
 
         {isIos && (
-          <p className="mt-3 text-center text-[10px] text-zinc-600">No sound? Turn the iPhone silent switch off.</p>
+          <p className="mt-3 text-center text-[10px] text-white/35">No sound? Turn the iPhone silent switch off.</p>
         )}
       </div>
 
@@ -434,7 +507,7 @@ export default function Listener({ sessionParam }: { sessionParam: string }) {
 
 function Shell({ children }: { children: React.ReactNode }) {
   return (
-    <div className="flex min-h-screen flex-col items-center justify-center bg-[#08090c] px-4 py-8 text-zinc-200">
+    <div className="flex min-h-screen flex-col items-center justify-center bg-black px-4 py-8 text-white">
       {children}
     </div>
   )
@@ -453,29 +526,29 @@ function WizardOverlay(props: {
     <div className="fixed inset-0 z-50 flex flex-col items-center justify-center bg-black/90 px-6 text-center">
       {props.mode === 'tapping' ? (
         <>
-          <div className="text-xs uppercase tracking-[0.3em] text-zinc-400">watch the TV screen</div>
+          <div className="text-xs uppercase tracking-[0.3em] text-white/50">watch the TV screen</div>
           <button
             onClick={props.onTap}
             className={`mt-8 grid h-44 w-44 place-items-center rounded-full border-4 text-lg font-bold leading-tight transition-all duration-100 ${
               props.flashPulse
                 ? 'scale-105 border-white bg-white text-black'
-                : 'border-emerald-400 bg-emerald-500/10 text-emerald-200 active:scale-95'
+                : 'border-[#5A66D9] bg-[#2C3480]/20 text-[#C7CCF7] active:scale-95'
             }`}
           >
             TAP<br />on flash
           </button>
-          <div className="mt-6 font-mono text-sm text-zinc-400">{props.taps} / 3 taps</div>
-          {props.msg && <div className="mt-3 max-w-xs text-xs text-amber-300">{props.msg}</div>}
-          <button onClick={props.onCancel} className="mt-6 text-xs text-zinc-500 underline hover:text-zinc-300">cancel</button>
+          <div className="mt-6 font-mono text-sm text-white/55">{props.taps} / 3 taps</div>
+          {props.msg && <div className="mt-3 max-w-xs text-xs text-[#C7CCF7]">{props.msg}</div>}
+          <button onClick={props.onCancel} className="mt-6 text-xs text-white/40 underline hover:text-white/80">cancel</button>
         </>
       ) : (
-        <div className="rounded-3xl border border-emerald-500/40 bg-emerald-500/10 px-8 py-7">
-          <div className="text-3xl text-emerald-300">✓</div>
-          <div className="mt-2 text-lg font-bold text-emerald-200">Auto-synced</div>
-          <div className="mt-1 font-mono text-sm text-zinc-300">
+        <div className="rounded-3xl border border-[#5A66D9]/50 bg-[#2C3480]/25 px-8 py-7">
+          <div className="text-3xl text-[#8A93E8]">✓</div>
+          <div className="mt-2 text-lg font-bold text-[#DDE1FF]">Auto-synced</div>
+          <div className="mt-1 font-mono text-sm text-white/75">
             lip-sync corrected {props.result != null ? `${props.result > 0 ? '+' : ''}${props.result}` : '0'} ms
           </div>
-          <div className="mt-2 text-xs text-zinc-500">Saved for this session — re-run anytime lips drift.</div>
+          <div className="mt-2 text-xs text-white/45">Saved for this session — the beacon keeps it locked from here.</div>
         </div>
       )}
     </div>
