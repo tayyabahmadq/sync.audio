@@ -109,6 +109,8 @@ export class SyncClient {
   private autoFixedMs = 0
   private autoPausedUntil = 0
   private lastRelockAt = 0
+  private lastAutoNudgeAt = 0
+  private autoBandStreak = 0
 
   connect(sessionCode: string, listenerName: string) {
     this.sessionCode = sessionCode.toUpperCase().trim()
@@ -294,7 +296,7 @@ export class SyncClient {
 
   /** Primary path — AudioWorklet jitter buffer (audio thread, glitch-free). */
   private async startWorkletPath(ctx: AudioContext): Promise<boolean> {
-    await ctx.audioWorklet.addModule('/worklets/player-worklet.js?v=3')
+    await ctx.audioWorklet.addModule('/worklets/player-worklet.js?v=4')
     const node = new AudioWorkletNode(ctx, 'sync-player', {
       numberOfInputs: 0,
       numberOfOutputs: 1,
@@ -344,11 +346,13 @@ export class SyncClient {
       let primed = false
       // live target: adaptive updates from the main thread reach the fallback too
       let targetSamples = (this.currentTargetMs / 1000) * this.streamSampleRate
+      let phaseSamples = 0 // persistent lip-sync phase (nudges) — fill anchor moves with it
       this.fallbackTarget = (ms: number) => { targetSamples = (ms / 1000) * this.streamSampleRate }
       this.fallbackNudge = (deltaMs: number) => {
         const s = Math.round((deltaMs / 1000) * this.streamSampleRate)
         if (s < 0) { const skip = Math.min(-s, filled); read = (read + skip) % cap; filled -= skip }
         else { const back = Math.min(s, filled); read = (read - back + cap * 2) % cap; filled += back }
+        phaseSamples = Math.max(-this.streamSampleRate, Math.min(this.streamSampleRate, phaseSamples + s))
       }
 
       this.fallbackPush = (samples: Float32Array) => {
@@ -368,7 +372,7 @@ export class SyncClient {
 
       sp.onaudioprocess = (ev) => {
         const out = ev.outputBuffer.getChannelData(0)
-        const target = targetSamples
+        const target = targetSamples + phaseSamples
         const err = filled - target
         adj = adj * 0.995 + Math.max(-0.03, Math.min(0.03, err / (this.streamSampleRate * 3))) * 0.005
         const step = (this.streamSampleRate / rate) * (1 + adj)
@@ -518,7 +522,7 @@ export class SyncClient {
     }
     if (!engaged || !this.beacon) return
 
-    const tvNow = this.beacon.mediaTsMs + (Date.now() - this.beacon.relayTs) // media ms on TV now
+    const tvNow = this.beacon.mediaTsMs + (Date.now() - this.beacon.relayTs) + (this.offsetEma ?? 0) // media ms on TV now, clock-offset corrected
     void this.probePlayout().then((probe) => {
       if (!probe || probe.mediaTsMs == null) return
       const err = probe.mediaTsMs - tvNow
@@ -527,6 +531,7 @@ export class SyncClient {
 
       const now = Date.now()
       if (Math.abs(err) <= 10) {
+        this.autoBandStreak = 0
         if (!this.autoLocked) {
           this.autoLocked = true
           this.onStatus({ driftMs: this.driftMs, autoLocked: true })
@@ -534,11 +539,28 @@ export class SyncClient {
         return
       }
       this.autoLocked = false
-      // after a big correction, give the ring time to settle
-      if (now - this.lastRelockAt < 1200) return
-      const delta = Math.abs(err) > 90 ? err : Math.round(err * 0.4) // instant re-lock vs micro-nudge
+      if (Math.abs(err) > 90) {
+        // instant re-lock for big errors (1.2 s min gap)
+        if (now - this.lastRelockAt < 1200) return
+        this.lastRelockAt = now
+        this.lastAutoNudgeAt = now
+        this.autoBandStreak = 0
+        this.autoFixedMs += Math.abs(err)
+        this.nudgeOffsetMs(err, { auto: true })
+        this.onStatus({ driftMs: this.driftMs, autoLocked: false, autoFixedMs: this.autoFixedMs })
+        return
+      }
+      // 10–90 ms band: micro-nudge only after TWO consecutive confirmations
+      // and never more often than every 2.5 s. A 1 Hz correction cadence is
+      // audible as rhythmic ticking, and the fill controller needs time to
+      // settle around the new phase before the next measurement means anything.
+      this.autoBandStreak++
+      if (this.autoBandStreak < 2) return
+      if (now - this.lastAutoNudgeAt < 2500) return
+      this.lastAutoNudgeAt = now
+      this.autoBandStreak = 0
+      const delta = Math.round(err * 0.4)
       if (!delta) return
-      if (Math.abs(err) > 90) this.lastRelockAt = now
       this.autoFixedMs += Math.abs(delta)
       this.nudgeOffsetMs(delta, { auto: true })
       this.onStatus({ driftMs: this.driftMs, autoLocked: false, autoFixedMs: this.autoFixedMs })

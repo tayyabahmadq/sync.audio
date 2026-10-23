@@ -30,6 +30,8 @@ class SyncPlayer extends AudioWorkletProcessor {
     this.readIdx = 0 // float position, in stream-rate samples
     this.filled = 0
     this.targetMs = opts.targetMs != null ? opts.targetMs : 140
+    this.baseTargetMs = this.targetMs // adaptive jitter target (main thread)
+    this.phaseMs = 0                  // persistent lip-sync phase (nudges)
     this.skipSamples = Math.max(0, Math.round(((opts.skipMs || 0) / 1000) * this.streamRate))
     this.adj = 0            // smoothed playback-rate correction
     this.starving = true
@@ -56,12 +58,20 @@ class SyncPlayer extends AudioWorkletProcessor {
       this.adj = 0
       this.primed = false
       this.fadeN = 0
+      this.phaseMs = 0
       this.lastMediaTsEnd = 0
     } else if (msg.type === 'target') {
-      this.targetMs = Math.max(40, Math.min(1000, msg.targetMs))
+      this.baseTargetMs = Math.max(40, Math.min(1000, msg.targetMs))
     } else if (msg.type === 'nudge') {
       const d = Math.max(-800, Math.min(800, msg.deltaMs || 0))
-      if (d !== 0) this.applyNudge(Math.round((d / 1000) * this.streamRate))
+      if (d !== 0) {
+        this.applyNudge(Math.round((d / 1000) * this.streamRate))
+        // CRITICAL: the fill controller must not eat lip-sync corrections.
+        // Move the fill anchor with the phase, or the rate corrector drains
+        // the rewind back to the old target within seconds and the closed
+        // loop re-nudges every beacon tick — audible as 1 Hz rhythmic ticks.
+        this.phaseMs = Math.max(-1000, Math.min(1000, this.phaseMs + d))
+      }
     } else if (msg.type === 'probe') {
       // media-timeline position of the sample currently reaching the ear + fill
       const mediaTs = this.lastMediaTsEnd > 0
@@ -113,7 +123,9 @@ class SyncPlayer extends AudioWorkletProcessor {
     const out = outputs[0][0]
     if (!out) return true
     const frames = out.length // 128
-    const target = (this.targetMs / 1000) * this.streamRate
+    // effective jitter target = adaptive base + persistent lip-sync phase
+    const targetMs = Math.max(40, Math.min(1000, this.baseTargetMs + this.phaseMs))
+    const target = (targetMs / 1000) * this.streamRate
     const skip = this.skipSamples
 
     // adaptive rate: eases fill toward target, keeps listeners phase-aligned
@@ -213,7 +225,7 @@ class SyncPlayer extends AudioWorkletProcessor {
         starving: this.starving,
         starveCount: this.starveCount,
         adj: this.adj,
-        targetMs: this.targetMs,
+        targetMs: Math.round(this.baseTargetMs + this.phaseMs),
         skipMs: (this.skipSamples / this.streamRate) * 1000,
         playoutMediaTs: this.lastMediaTsEnd > 0
           ? this.lastMediaTsEnd - (this.filled / this.streamRate) * 1000
