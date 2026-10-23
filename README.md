@@ -1,18 +1,89 @@
 <p align="center">
-  <img src="public/logo.png" alt="Sync.audio" width="460">
+  <img src="public/logo.png" alt="Sync.audio" width="440">
 </p>
 
 <h1 align="center">Sync.audio</h1>
 
 <p align="center">
-  <strong>The room stays silent. Every earbud screams.</strong>
+  <strong>The room stays silent. Every earbud screams.</strong><br>
+  Silent group listening for Fire TV — the TV plays muted, every phone in the room becomes the speaker,
+  and a closed-loop sync beacon keeps each earbud lip-locked to the picture.
 </p>
 
 <p align="center">
   <a href="LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-2C3480.svg"></a>
-  <img alt="Next.js" src="https://img.shields.io/badge/Next.js-16-black.svg">
+  <img alt="Next.js 16" src="https://img.shields.io/badge/Next.js-16-black.svg">
   <img alt="Web Audio API" src="https://img.shields.io/badge/Web%20Audio-AudioWorklet-2C3480.svg">
-  <img alt="WebSocket" src="https://img.shields.io/badge/transport-WebSocket-black.svg">
+  <img alt="relay" src="https://img.shields.io/badge/relay-socket.io-black.svg">
+  <img alt="Bun" src="https://img.shields.io/badge/runtime-Bun-f472b6.svg">
+  <img alt="platform" src="https://img.shields.io/badge/platform-Fire%20TV%20%C2%B7%20Vega%20OS-FF9900.svg">
+</p>
+
+<div align="center">
+
+| **≤ 50 ms** | **unlimited** | **< 15 ms** | **0 installs** |
+|:---:|:---:|:---:|:---:|
+| worst-case drift — measured live, on screen, both consoles | listeners per session — stateless relay fan-out | LAN round-trip — measured 3–8 ms | to join — QR scan → listening |
+
+</div>
+
+<p align="center">
+  <a href="https://u1myc8h6uys0-d.space-z.ai/">Live demo</a> ·
+  <a href="https://youtu.be/0AVkqdIALVQ">3-min video</a> ·
+  <a href="#quick-start">Quick start</a> ·
+  <a href="#how-it-works">How sync works</a> ·
+  <a href="#technical-specs">Specs</a> ·
+  <a href="FRICTION-LOG.md">Friction log</a>
+</p>
+
+---
+
+Smart TVs — including Fire TV — pair with **exactly one Bluetooth audio device** at a time. One soundbar or one headphone, never a room full of them. Sync.audio flips that: the TV plays *silently*, captures its master audio locally, and streams it over the room's own Wi-Fi to **unlimited phones** that join with a single QR scan — no app install, no accounts, no cloud, no pairing. Every phone becomes a wireless receiver, and while the host broadcasts, a 1-second **sync beacon** lets each phone continuously measure and correct its own lip error against the picture.
+
+## Real output — this is what running it looks like
+
+Nothing on this page is a mockup. Start the two processes and the screens below are what you see (relay trace reproduced with [`scripts/capture_relay_session.mjs`](scripts/capture_relay_session.mjs)):
+
+```text
+# Terminal 1 — the relay: a local broadcast tower on :3003
+$ cd mini-services/sync-service && npm install && npm run dev
+Sync.audio relay service listening on :3003
+[conn] HjGkY56k0PpfCGnrAAAA
+[host] HjGkY56k0PpfCGnrAAAA hosting session K7Q2M
+[conn] QpPIeeTQdfhD4uCbAAAB
+[listener] Pixel-8 joined K7Q2M (total 1)
+[conn] 4ji1syhe9_3WrNf1AAAC
+[listener] iPhone-15-Pro joined K7Q2M (total 2)
+[conn] -j5djGaq1PVWXOyYAAAD
+[listener] Galaxy-S24 joined K7Q2M (total 3)
+[disc] -j5djGaq1PVWXOyYAAAD
+[listener] Galaxy-S24 left K7Q2M (total 2)
+[disc] QpPIeeTQdfhD4uCbAAAB
+[listener] Pixel-8 left K7Q2M (total 1)
+[disc] 4ji1syhe9_3WrNf1AAAC
+[listener] iPhone-15-Pro left K7Q2M (total 0)
+[disc] HjGkY56k0PpfCGnrAAAA
+```
+
+```text
+# Terminal 2 — the web app ("the TV")
+$ npm run dev
+▲ Next.js 16.1.3 (Turbopack)
+- Local:         http://localhost:3000
+- Environments:  .env
+
+✓ Starting...
+✓ Ready in 617ms
+```
+
+## Captured live
+
+Host console mid-broadcast and the listener PWA mid-session — screenshots from the deployed app, not design mocks. The RTT chips in the listener list are measured values from real WebSocket connections.
+
+<p align="center">
+  <img src="docs/screenshots/host.png" alt="Host console — ON AIR, QR join code, connected listeners with measured RTT" width="49%">
+&nbsp;
+  <img src="docs/screenshots/listener.png" alt="Listener PWA — receiving, in sync, auto-sync card" width="49%">
 </p>
 
 ## The problem
@@ -20,14 +91,6 @@
 Smart TVs — including Fire TV — allow **exactly one Bluetooth audio receiver** at a time. One soundbar or one headphone, never a room full of them. So when a group wants to watch the same screen with personal audio (late-night sports bar, dorm room, shared flat, gym wall), everyone fights over a single pairing slot or huddles around phone speakers on a video call.
 
 **Sync.audio flips the model**: the TV (or any browser host) plays *silently*, captures its master audio locally, and streams it over the room's own Wi-Fi to **unlimited phones** that join with a single QR scan — no app install, no accounts, no cloud, no pairing. Every phone becomes a wireless receiver, and a closed-loop sync beacon keeps every earbud **lip-locked to the picture (drift ≤ 50 ms, measured on screen)**.
-
-## Demo
-
-- **Live app**: [https://u1myc8h6uys0-d.space-z.ai/](https://u1myc8h6uys0-d.space-z.ai/)
-  - Host console: add `/?p=host` — then press **Play demo — go live**
-  - Listener: scan the on-screen QR, or open `/?p=join&s=CODE`
-- **Video (3 min)**: [https://youtu.be/0AVkqdIALVQ](https://youtu.be/0AVkqdIALVQ)
-- **Developer friction log**: [FRICTION-LOG.md](FRICTION-LOG.md) — every platform friction we hit, its cost, our workaround, and the open asks
 
 ## How it works
 
@@ -134,7 +197,8 @@ src/components/sync/  landing, host console, listener, design atoms
 public/worklets/    AudioWorklet DSP (capture + adaptive-jitter player)
 mini-services/      socket.io relay: rooms, binary fan-out, timesync, beacon
 aws/                SAM template + Lambda (telemetry ingest → DynamoDB)
-docs/               submission checklist, feedback answers
+scripts/            reproducible demo tooling (relay session capture, logo swap)
+docs/               submission checklist, screenshots, feedback answers
 ARCHITECTURE.md     full system design: loop spec, latency budget, protocol
 FRICTION-LOG.md     developer-experience record: frictions, workarounds, platform asks
 ```
@@ -143,6 +207,13 @@ FRICTION-LOG.md     developer-experience record: frictions, workarounds, platfor
 
 The host runs today on the **Fire OS / Vega OS simulator** and any browser via the web-first path (WebView ≈ desktop Chromium: AudioWorklet, `MediaElementAudioSourceNode`, QR rendering all work). The single biggest ecosystem unlock would be a public API for capturing **system master audio** on Fire OS — the rest of this stack (relay, protocol, listeners) ports to a native Vega OS host app unchanged.
 
+## Demo links
+
+- **Live app**: [https://u1myc8h6uys0-d.space-z.ai/](https://u1myc8h6uys0-d.space-z.ai/)
+  - Host console: add `/?p=host` — then press **Play demo — go live**
+  - Listener: scan the on-screen QR, or open `/?p=join&s=CODE`
+- **Video (3 min)**: [https://youtu.be/0AVkqdIALVQ](https://youtu.be/0AVkqdIALVQ)
+
 ## License
 
-[MIT](LICENSE) — use it, fork it, ship it. Contributions welcome.
+[MIT](LICENSE) — use it, fork it, ship it. Built in a 12-hour sprint for the **Amazon Developer Hackathon** (Fire TV track + Open Source Mini Challenge). Contributions welcome.
