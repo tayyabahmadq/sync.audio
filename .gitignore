@@ -1,27 +1,2 @@
-# deps / build
-node_modules/
-.next/
-out/
-
-# env & secrets
-.env
-.env.*
-!.env.example
-
-# local runtime artifacts
-db/
-*.log
-dev.pid
-
-# sandbox / platform workspace (not part of the app)
 skills/
-.zscripts/
-.zshots-*.png
-examples/
-tests/
-worklog.md
-download/
-upload/
-
-# misc
-.DS_Store
+node_modules/
