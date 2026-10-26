@@ -6,7 +6,7 @@
     "role": "maintainer",
     "name": "Tayyab Ahmed",
     "email": "ctayyabahmed@gmail.com",
-    "description": "I am an independent software engineer and open-source maintainer based in India, building low-latency media systems and developer tools. I am the primary maintainer of Sync.audio, an open-source zero-hardware silent audio broadcasting protocol for Smart TV and web runtimes. My goal is to establish sub-50ms Web Audio and WebSocket streaming standards that allow multi-user personal listening without dedicated hardware splitters or dongles.",
+    "description": "I am a developer from India, an independent software engineer and open source maintainer building low latency media systems and developer tools. I'm the lead maintainer of Sync.audio, an open-source zero-hardware silent audio broadcasting protocol for Smart TV and web runtimes. I want to create sub-50ms web audio and web socket streaming standards for multi-user personal listening without dedicated hardware splitters or dongles.",
     "webpageUrl": {
       "url": "https://github.com/tayyabahmadq"
     }
@@ -15,7 +15,7 @@
     {
       "guid": "sync-audio",
       "name": "Sync.audio",
-      "description": "Sync.audio is an MIT-licensed, local-first low-latency silent audio broadcasting engine for Smart TVs (Fire OS / Vega OS) and web browsers. It captures audio from host media streams via AudioWorklet background threads and relays binary PCM chunks over WebSockets to client mobile devices. Clients process audio in custom Web Audio player worklets, offering real-time lip-sync calibration, sub-50ms latency telemetry, and zero-hardware setup without native app installs. This grant will fund core DSP engine optimization, low-level TV platform web shell integration, dynamic lip-sync drift calibration, and public maintainer documentation.",
+      "description": "Sync.audio is a local-first low-latency silent audio broadcasting engine for Smart TVs (Fire OS / Vega OS) and web browsers, MIT licensed. It records audio from host media streams using AudioWorklet background threads and sends binary PCM chunks to client mobile devices via WebSockets. Clients run audio in custom Web Audio player worklets, providing real-time lip-sync calibration, sub-50ms latency telemetry, and zero-hardware setup without any native app installs. This grant will pay for core DSP engine optimisation, low level TV platform web shell integration, dynamic lip-sync drift calibration, domain, hosting and public maintainer documentation.",
       "webpageUrl": {
         "url": "https://github.com/tayyabahmadq/sync.audio"
       },
@@ -43,12 +43,12 @@
       {
         "guid": "grant-upi-transfer",
         "type": "other",
-        "description": "UPI payment handle/VPA details will be provided directly to the grant administrator upon request. Account identifiers are omitted from public manifest."
+        "description": "UPI payment handle"
       },
       {
         "guid": "grant-bank-transfer",
         "type": "bank",
-        "description": "Direct bank-to-bank transfer details (NEFT/RTGS/IMPS) will be provided directly to the grant administrator after approval. No account numbers are published in this manifest."
+        "description": "Direct bank-to-bank transfer (NEFT/RTGS/IMPS)"
       }
     ],
     "plans": [
