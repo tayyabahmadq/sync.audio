@@ -1,0 +1,83 @@
+{
+  "$schema": "https://fundingjson.org/schema/v1.1.0.json",
+  "version": "v1.1.0",
+  "entity": {
+    "type": "individual",
+    "role": "maintainer",
+    "name": "Tayyab Ahmed",
+    "email": "ctayyabahmed@gmail.com",
+    "description": "I am an independent software engineer and open-source maintainer based in India, building low-latency media systems and developer tools. I am the primary maintainer of Sync.audio, an open-source zero-hardware silent audio broadcasting protocol for Smart TV and web runtimes. My goal is to establish sub-50ms Web Audio and WebSocket streaming standards that allow multi-user personal listening without dedicated hardware splitters or dongles.",
+    "webpageUrl": {
+      "url": "https://github.com/tayyabahmadq"
+    }
+  },
+  "projects": [
+    {
+      "guid": "sync-audio",
+      "name": "Sync.audio",
+      "description": "Sync.audio is an MIT-licensed, local-first low-latency silent audio broadcasting engine for Smart TVs (Fire OS / Vega OS) and web browsers. It captures audio from host media streams via AudioWorklet background threads and relays binary PCM chunks over WebSockets to client mobile devices. Clients process audio in custom Web Audio player worklets, offering real-time lip-sync calibration, sub-50ms latency telemetry, and zero-hardware setup without native app installs. This grant will fund core DSP engine optimization, low-level TV platform web shell integration, dynamic lip-sync drift calibration, and public maintainer documentation.",
+      "webpageUrl": {
+        "url": "https://github.com/tayyabahmadq/sync.audio"
+      },
+      "repositoryUrl": {
+        "url": "https://github.com/tayyabahmadq/sync.audio"
+      },
+      "licenses": [
+        "spdx:MIT"
+      ],
+      "tags": [
+        "developer-tools",
+        "web-audio",
+        "websockets",
+        "smart-tv",
+        "fire-tv",
+        "low-latency",
+        "audio-dsp",
+        "local-first",
+        "open-source"
+      ]
+    }
+  ],
+  "funding": {
+    "channels": [
+      {
+        "guid": "grant-upi-transfer",
+        "type": "other",
+        "description": "UPI payment handle/VPA details will be provided directly to the grant administrator upon request. Account identifiers are omitted from public manifest."
+      },
+      {
+        "guid": "grant-bank-transfer",
+        "type": "bank",
+        "description": "Direct bank-to-bank transfer details (NEFT/RTGS/IMPS) will be provided directly to the grant administrator after approval. No account numbers are published in this manifest."
+      }
+    ],
+    "plans": [
+      {
+        "guid": "sync-audio-milestone-1",
+        "status": "active",
+        "name": "Sync.audio Milestone 1: Core Engine & DSP Pipeline (Month 1)",
+        "description": "Month 1 Milestone: Core Web Audio DSP pipeline, native media engine integration, AudioWorklet raw PCM buffer processing, Bun/Node WebSocket signaling relay, and sub-50ms telemetry monitoring. INR 80,000.",
+        "amount": 80000,
+        "currency": "INR",
+        "frequency": "one-time",
+        "channels": [
+          "grant-upi-transfer",
+          "grant-bank-transfer"
+        ]
+      },
+      {
+        "guid": "sync-audio-milestone-2",
+        "status": "active",
+        "name": "Sync.audio Milestone 2: Low-Level Smart TV Shell & Calibration (Month 2)",
+        "description": "Month 2 Milestone: Smart TV web shell optimization (Fire OS / Vega OS), D-pad spatial remote navigation, dynamic lip-sync DelayNode drift calibration, and public maintainer setup documentation. INR 80,000.",
+        "amount": 80000,
+        "currency": "INR",
+        "frequency": "one-time",
+        "channels": [
+          "grant-upi-transfer",
+          "grant-bank-transfer"
+        ]
+      }
+    ]
+  }
+}
